@@ -1,0 +1,1561 @@
+// Terminal-emulation invariants, checked headlessly.
+//
+// Compiles the real TerminalState, Parser and Profile sources into a plain
+// command-line binary and asserts on the grid they produce. There is no CI in
+// this repo, so this is what stands between a parser change and finding out by
+// eye — run it after touching the parser, the grid, wrapping, scrollback or
+// the palette.
+//
+// Read-only on purpose: it constructs terminal buffers and decodes JSON, and
+// touches nothing under ~/Library/Application Support. (Note that $HOME does
+// not redirect `FileManager.applicationSupportDirectory` on macOS, so a test
+// that wrote through `ProfileStore.shared` would edit the real profiles even
+// under a sandboxed HOME. Don't add one.)
+//
+// Run it with scripts/statecheck.sh.
+
+import AppKit
+import Foundation
+
+// ThemeStore reads NSApp.effectiveAppearance on init, and `Cell` falls back to
+// ThemeStore.currentTheme — a static mirror hardcoded to dark until `shared`
+// is first built. Both must exist before any terminal object does.
+_ = NSApplication.shared
+_ = ThemeStore.shared
+
+var failures = 0
+func check(_ name: String, _ passed: Bool, _ detail: String = "") {
+    print("\(passed ? "  ok  " : "  FAIL") \(name)\(detail.isEmpty ? "" : "  — \(detail)")")
+    if !passed { failures += 1 }
+}
+
+func section(_ title: String) { print("\n\(title)") }
+
+/// A buffer with a parser already wired to it.
+func buffer(cols: Int = 20, rows: Int = 4, scrollback: Int = 100,
+            theme: Theme = ThemeStore.currentTheme) -> (TerminalState, (String) -> Void) {
+    let state = TerminalState(cols: cols, rows: rows, scrollback: scrollback, theme: theme)
+    let parser = Parser()
+    parser.sink = state
+    return (state, { text in
+        Array(text.utf8).withUnsafeBufferPointer { parser.feed(bytes: $0) }
+    })
+}
+
+/// Row `r` of the viewport as a string, trailing blanks trimmed.
+func row(_ snapshot: TerminalSnapshot, _ r: Int) -> String {
+    var out = ""
+    for c in 0..<snapshot.cols {
+        let cell = snapshot.cells[((r + snapshot.rowOffset) % snapshot.rows) * snapshot.cols + c]
+        if cell.isContinuation { continue }
+        out.append(Character(cell.scalar))
+    }
+    while out.hasSuffix(" ") { out.removeLast() }
+    return out
+}
+
+section("printing and wrapping")
+do {
+    let (s, feed) = buffer(cols: 10, rows: 3)
+    feed("hello")
+    check("text lands on the first row", row(s.snapshot(), 0) == "hello")
+
+    let (w, wfeed) = buffer(cols: 5, rows: 3)
+    wfeed("abcdefgh")
+    let snap = w.snapshot()
+    check("a long line wraps at the edge",
+          row(snap, 0) == "abcde" && row(snap, 1) == "fgh")
+
+    let (u, ufeed) = buffer(cols: 10, rows: 3)
+    ufeed("日本語")
+    check("double-width characters take two columns each",
+          u.snapshot().cursorCol == 6, "cursor at \(u.snapshot().cursorCol)")
+
+    // An erase ending inside a wide glyph leaves one half behind. It is not
+    // half of a pair any more, so writing over it must not blank whatever
+    // was just printed beside it. The SGR between the letters is what a
+    // coloured prompt puts there, and keeps them apart however text is fed.
+    let (t, tfeed) = buffer(cols: 10, rows: 3)
+    tfeed("中\r\u{1b}[1Kg\u{1b}[mr")
+    check("a stray trailing half doesn't take the glyph before it",
+          row(t.snapshot(), 0) == "gr", "row 0 is \"\(row(t.snapshot(), 0))\"")
+
+    let (h, hfeed) = buffer(cols: 10, rows: 3)
+    hfeed("中\u{8}\u{1b}[Ka\rx")
+    check("a stray leading half doesn't take the glyph after it",
+          row(h.snapshot(), 0) == "xa", "row 0 is \"\(row(h.snapshot(), 0))\"")
+
+    let (d, dfeed) = buffer(cols: 10, rows: 3)
+    dfeed("\u{1b}(0lqqk\u{1b}(Bok")
+    check("DEC line drawing still applies to a run of text",
+          row(d.snapshot(), 0) == "┌──┐ok", "row 0 is \"\(row(d.snapshot(), 0))\"")
+}
+
+section("printable runs")
+do {
+    // The parser hands printable ASCII over a run at a time, and TerminalState
+    // writes a run a span at a time. That has to land exactly as the same
+    // glyphs would one by one, which is what this sink does with them: it
+    // takes the protocol's default, and forwards everything else untouched.
+    final class GlyphAtATime: ParserSink {
+        let state: TerminalState
+        init(_ state: TerminalState) { self.state = state }
+        func parserPrint(_ scalar: Unicode.Scalar) { state.parserPrint(scalar) }
+        func parserExecute(_ control: UInt8) { state.parserExecute(control) }
+        func parserCSI(_ p: [Int], marker: UInt8?, intermediates: [UInt8], final: UInt8) {
+            state.parserCSI(p, marker: marker, intermediates: intermediates, final: final)
+        }
+        func parserOSC(_ data: [UInt8], terminator: UInt8) { state.parserOSC(data, terminator: terminator) }
+        func parserESC(_ final: UInt8, intermediates: [UInt8]) {
+            state.parserESC(final, intermediates: intermediates)
+        }
+        func parserWindowName(_ name: [UInt8]) { state.parserWindowName(name) }
+        func parserDCSStart(_ params: [Int], intermediates: [UInt8], final: UInt8) {
+            state.parserDCSStart(params, intermediates: intermediates, final: final)
+        }
+        func parserDCSPut(_ bytes: ArraySlice<UInt8>) { state.parserDCSPut(bytes) }
+        func parserDCSEnd() { state.parserDCSEnd() }
+    }
+
+    // Everything that decides where a glyph lands or what it overwrites:
+    // wide glyphs and marks, cursor moves, erases, backspace over a wide
+    // glyph, DEC line drawing, autowrap on and off, scroll regions, inverse,
+    // hyperlinks, and runs long enough to wrap several times.
+    var seed: UInt64 = 0x9E3779B97F4A7C15
+    func next(_ n: Int) -> Int {
+        seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17
+        return Int(seed % UInt64(n))
+    }
+    let esc = "\u{1b}"
+    let words = ["the", "grid", "x", "a=b", "~/src", "longerthanthenarrowestgrid"]
+    var text = ""
+    while text.utf8.count < 60_000 {
+        switch next(20) {
+        case 0: text += "\(esc)[\(1 + next(8));\(1 + next(90))H"
+        case 1: text += ["日本語", "한", "😀", "e\u{0301}", "ｆｕ"][next(5)]
+        case 2: text += "\r"
+        case 3: text += "\u{8}\u{8}"
+        case 4: text += next(2) == 0 ? "\(esc)(0" : "\(esc)(B"
+        case 5: text += next(2) == 0 ? "\(esc)[?7l" : "\(esc)[?7h"
+        case 6: text += next(2) == 0 ? "\(esc)[7m" : "\(esc)[27m"
+        case 7: text += "\(esc)]8;;https://x.test/\(next(9))\u{7}"
+        case 8: text += "\(esc)]8;;\u{7}"
+        case 9: text += "\r\n"
+        case 10: text += "\(esc)[\(1 + next(3));\(4 + next(4))r"
+        case 11: text += "\(esc)[r"
+        case 12: text += "\t"
+        case 13: text += "\(esc)[\(next(3))K"
+        // Back onto a wide glyph's head, maybe erase up to it, then print
+        // across its tail: the one shape where writing a span and writing a
+        // glyph at a time have come apart, so it is not left to chance.
+        case 16, 17, 18:
+            text += ["日本語", "한", "😀", "ｆｕ"][next(4)] + "\u{8}\u{8}"
+            if next(2) == 0 { text += "\(esc)[1K" }
+            text += words[next(words.count)]
+        default: text += words[next(words.count)] + String(repeating: "q", count: next(40))
+        }
+    }
+    let bytes = Array(text.utf8)
+
+    for cols in [80, 13, 1] {
+        let runs = TerminalState(cols: cols, rows: 4, scrollback: 50)
+        let glyphs = TerminalState(cols: cols, rows: 4, scrollback: 50)
+        let runParser = Parser(), glyphParser = Parser()
+        runParser.sink = runs
+        glyphParser.sink = GlyphAtATime(glyphs)
+        // Ragged chunks, like PTY reads, so runs are cut at every kind of edge.
+        bytes.withUnsafeBufferPointer { buf in
+            var off = 0
+            while off < buf.count {
+                let n = min(1 + next(700), buf.count - off)
+                let chunk = UnsafeBufferPointer(start: buf.baseAddress! + off, count: n)
+                runParser.feed(bytes: chunk)
+                glyphParser.feed(bytes: chunk)
+                off += n
+            }
+        }
+        // Every page of history as well as the screen.
+        var same = runs.snapshot().scrollbackLines == glyphs.snapshot().scrollbackLines
+            && runs.snapshot().cursorCol == glyphs.snapshot().cursorCol
+            && runs.snapshot().cursorRow == glyphs.snapshot().cursorRow
+        var offset = 0
+        while same {
+            let a = runs.viewportSnapshot(scrollOffset: offset)
+            let b = glyphs.viewportSnapshot(scrollOffset: offset)
+            same = a.rowOffset == b.rowOffset && a.rowWrapped == b.rowWrapped
+                && a.cells.withUnsafeBytes { x in b.cells.withUnsafeBytes { y in x.elementsEqual(y) } }
+            if offset >= a.scrollbackLines { break }
+            offset = min(offset + a.rows, a.scrollbackLines)
+        }
+        check("runs land exactly as glyphs one at a time at \(cols) columns", same)
+    }
+}
+
+section("screen capture")
+do {
+    /// A copy of `source` built from its capture, the way a second head gets
+    /// one: a fresh buffer of the same size and theme, fed the screen and
+    /// then whatever sequence `sourceParser` is partway through.
+    func mirror(of source: TerminalState, _ sourceParser: Parser) -> (TerminalState, Parser) {
+        let snap = source.snapshot()
+        let copy = TerminalState(cols: snap.cols, rows: snap.rows, scrollback: 100,
+                                 theme: source.theme)
+        let parser = Parser()
+        parser.sink = copy
+        (source.encodeScreen() + sourceParser.pendingSequence())
+            .withUnsafeBufferPointer { parser.feed(bytes: $0) }
+        return (copy, parser)
+    }
+
+    /// The first way `b` differs from `a` that anything could see, or nil.
+    /// Scrollback is not compared: it is history, and not in a capture.
+    func difference(_ a: TerminalState, _ b: TerminalState) -> String? {
+        let sa = a.snapshot(), sb = b.snapshot()
+        guard sa.cols == sb.cols, sa.rows == sb.rows else { return "size" }
+        if sa.cursorCol != sb.cursorCol || sa.cursorRow != sb.cursorRow {
+            return "cursor \(sa.cursorCol),\(sa.cursorRow) vs \(sb.cursorCol),\(sb.cursorRow)"
+        }
+        if sa.cursorVisible != sb.cursorVisible { return "cursor visibility" }
+        if sa.usingAlt != sb.usingAlt { return "alt screen" }
+        if sa.title != sb.title { return "title \"\(sa.title)\" vs \"\(sb.title)\"" }
+        if sa.currentDirectory != sb.currentDirectory { return "directory" }
+        let marks = { (s: TerminalSnapshot) in s.prompts.map { "\($0.viewportRow):\($0.exitCode ?? -1)" } }
+        if marks(sa) != marks(sb) { return "prompt marks \(marks(sa)) vs \(marks(sb))" }
+        if sa.rowWrapped != sb.rowWrapped { return "wrap flags \(sa.rowWrapped) vs \(sb.rowWrapped)" }
+        if a.bracketedPaste != b.bracketedPaste || a.reportFocus != b.reportFocus
+            || a.mouseTracking != b.mouseTracking || a.mouseEncoding != b.mouseEncoding
+            || a.alternateScroll != b.alternateScroll { return "modes" }
+        for r in 0 ..< sa.rows {
+            for c in 0 ..< sa.cols {
+                let x = sa.cells[((r + sa.rowOffset) % sa.rows) * sa.cols + c]
+                let y = sb.cells[((r + sb.rowOffset) % sb.rows) * sb.cols + c]
+                let lx = x.link == 0 ? "" : sa.links[Int(x.link) - 1]
+                let ly = y.link == 0 ? "" : sb.links[Int(y.link) - 1]
+                if x.scalar != y.scalar || x.fg != y.fg || x.bg != y.bg || x.attrs != y.attrs
+                    || x.width != y.width || lx != ly {
+                    func show(_ z: Cell, _ l: String) -> String {
+                        "\"\(z.scalar)\" w\(z.width) fg\(String(z.fg.value, radix: 16)) bg\(String(z.bg.value, radix: 16)) a\(z.attrs.rawValue) \(l)"
+                    }
+                    return "cell \(c),\(r): \(show(x, lx)) vs \(show(y, ly))"
+                }
+            }
+        }
+        return nil
+    }
+
+    func feed(_ parser: Parser, _ text: String) {
+        Array(text.utf8).withUnsafeBufferPointer { parser.feed(bytes: $0) }
+    }
+
+    /// Builds a screen from `setup`, mirrors it, then sends `after` to both.
+    func roundTrip(cols: Int = 10, rows: Int = 4, _ setup: String,
+                   then after: String = "") -> String? {
+        let (s, _) = buffer(cols: cols, rows: rows)
+        let p = Parser()
+        p.sink = s
+        feed(p, setup)
+        let (m, mp) = mirror(of: s, p)
+        if let d = difference(s, m) { return "on capture: \(d)" }
+        guard !after.isEmpty else { return nil }
+        feed(p, after)
+        feed(mp, after)
+        return difference(s, m).map { "after: \($0)" }
+    }
+
+    let esc = "\u{1b}"
+    var d = roundTrip(cols: 40, rows: 3,
+        "\(esc)[1;31mred\(esc)[0m \(esc)[7minv\(esc)[27m \(esc)[2;3;4mfaint\(esc)[0m 日本 😀 e\u{0301} "
+        + "\(esc)]8;;https://a.test/\u{07}link\(esc)]8;;\u{07}\r\n\(esc)[48;5;22m\(esc)[Kband "
+        + "\(esc)[38;2;1;2;3mrgb")
+    check("colours, attributes, wide glyphs and links come back cell for cell", d == nil, d ?? "")
+
+    d = roundTrip("primary\r\n\(esc)[32mpen\(esc)[?1049halt screen\(esc)7",
+                  then: "\(esc)8saved\(esc)[?1049lback")
+    check("the primary screen behind the alt screen comes back, with its cursor and pen",
+          d == nil, d ?? "")
+
+    d = roundTrip("0123456789", then: "Z")
+    check("a wrap pending at the right edge still wraps", d == nil, d ?? "")
+
+    d = roundTrip(rows: 6, "\(esc)[2;4r\(esc)[?6h\(esc)[2;3Hx",
+                  then: "\(esc)[Hhome\n\n\n\nscrolled")
+    check("margins and origin mode put the next cursor move where the original's goes",
+          d == nil, d ?? "")
+
+    d = roundTrip("\(esc)[3;5H\(esc)[1;32m\(esc)]8;;https://s.test/\u{07}\(esc)7\(esc)[0m\(esc)]8;;\u{07}\(esc)[H",
+                  then: "\(esc)8saved")
+    check("the DECSC slot survives, pen and link with it", d == nil, d ?? "")
+
+    d = roundTrip(
+        "\(esc)[1;3H中\(esc)[1;3H\(esc)[1K"            // right half left alone, mid-row
+        + "\(esc)[1;6H中\(esc)[1;7H\(esc)[K"            // left half left alone, mid-row
+        + "\(esc)[2;9H中\(esc)[2;9H\(esc)[1K"           // right half in the last column
+        + "\(esc)[3;8H中\(esc)[3;1H\(esc)[2@"           // left half pushed into the last column
+        + "\(esc)[4;1H中\(esc)[4;1H\(esc)[P",           // right half slid into column 0
+        then: "\(esc)[1;1Hab\(esc)[1;6Hcd")
+    check("stray halves of wide glyphs come back where they were", d == nil, d ?? "")
+
+    d = roundTrip(cols: 20, rows: 4,
+        "\(esc)]133;A\u{07}$ ls\r\n\(esc)]133;D;1\u{07}\(esc)]133;A\u{07}$ "
+        + "\(esc)]2;hello\u{07}\(esc)]7;file:///tmp/a%20b\u{07}")
+    check("prompt marks, the title and the directory come back", d == nil, d ?? "")
+
+    d = roundTrip(cols: 20, "before \(esc)[3", then: "1mred")
+    check("a capture taken inside an escape sequence finishes it", d == nil, d ?? "")
+    do {
+        let (s, _) = buffer(cols: 20, rows: 2)
+        let p = Parser()
+        p.sink = s
+        ([0x61, 0xE6] as [UInt8]).withUnsafeBufferPointer { p.feed(bytes: $0) }
+        let (m, mp) = mirror(of: s, p)
+        ([0x97, 0xA5, 0x62] as [UInt8]).withUnsafeBufferPointer { p.feed(bytes: $0); mp.feed(bytes: $0) }
+        let diff = difference(s, m)
+        check("a capture taken inside a UTF-8 character finishes it",
+              diff == nil && row(m.snapshot(), 0) == "a日b", diff ?? row(m.snapshot(), 0))
+    }
+
+    // Why a resize reaches a mirror as a fresh capture rather than as a size:
+    // widening rejoins a wrapped line across the top of the screen, pulling
+    // its start back out of history — which a copy that attached later never
+    // had. Resized itself, the copy below would begin "KLMNOPQRST".
+    do {
+        let (s, _) = buffer(cols: 10, rows: 3)
+        let p = Parser()
+        p.sink = s
+        feed(p, "abcdefghijKLMNOPQRSTuvwxyz0123456789")
+        s.resize(cols: 30, rows: 3)
+        let (m, _) = mirror(of: s, p)
+        let diff = difference(s, m)
+        check("after a resize, a fresh capture has the line rejoined from history",
+              diff == nil && row(m.snapshot(), 0) == "abcdefghijKLMNOPQRSTuvwxyz0123",
+              diff ?? row(m.snapshot(), 0))
+    }
+
+    // A second head attaching at any moment: a mirror started between any
+    // two reads of a stream, then fed every read after it, has to end up
+    // identical to the original. Everything a program can do to the grid is
+    // in the stream — including leaving halves of wide glyphs behind, which
+    // is where drawing a screen back is hardest.
+    var seed: UInt64 = 0xD1B5_4A32_D192_ED03
+    func next(_ n: Int) -> Int {
+        seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17
+        return Int(seed % UInt64(n))
+    }
+    func sgr() -> String {
+        let parts = ["0", "1", "2", "3", "4", "7", "22", "27", "39", "49",
+                     "3\(next(8))", "4\(next(8))", "9\(next(8))", "10\(next(8))",
+                     "38;5;\(next(256))", "48;5;\(next(256))",
+                     "38;2;\(next(256));\(next(256));\(next(256))",
+                     "48;2;\(next(256));\(next(256));\(next(256))"]
+        return "\(esc)[" + (0 ... next(3)).map { _ in parts[next(parts.count)] }.joined(separator: ";") + "m"
+    }
+    let words = ["the", "grid", "x", "a=b", "~/src", "longerthanthenarrowestgrid"]
+    var text = ""
+    while text.utf8.count < 40_000 {
+        switch next(34) {
+        case 0: text += "\(esc)[\(1 + next(8));\(1 + next(90))H"
+        case 1: text += ["日本語", "한", "😀", "e\u{0301}", "ｆｕ", "中"][next(6)]
+        case 2: text += "\r"
+        case 3: text += "\n"
+        case 4: text += "\u{8}"
+        case 5: text += "\t"
+        case 6: text += "\(esc)[\(next(3))K"
+        case 7: text += "\(esc)[\(next(4))J"
+        case 8: text += "\(esc)[\(1 + next(3))X"
+        case 9: text += "\(esc)[\(1 + next(3))P"
+        case 10: text += "\(esc)[\(1 + next(3))@"
+        case 11: text += "\(esc)[\(1 + next(2))L"
+        case 12: text += "\(esc)[\(1 + next(2))M"
+        case 13: text += "\(esc)[\(1 + next(2))S"
+        case 14: text += "\(esc)[\(1 + next(2))T"
+        case 15: text += next(3) == 0 ? "\(esc)[r" : "\(esc)[\(1 + next(3));\(3 + next(5))r"
+        case 16: text += "\(esc)[?6" + (next(2) == 0 ? "h" : "l")
+        case 17: text += "\(esc)[?7" + (next(2) == 0 ? "h" : "l")
+        case 18: text += "\(esc)[?25" + (next(2) == 0 ? "h" : "l")
+        case 19: text += ["\(esc)[?1049h", "\(esc)[?1049l", "\(esc)[?1047h", "\(esc)[?1047l",
+                          "\(esc)[?1048h", "\(esc)[?1048l"][next(6)]
+        case 20: text += ["\(esc)7", "\(esc)8", "\(esc)[s", "\(esc)[u"][next(4)]
+        case 21: text += ["\(esc)(0", "\(esc)(B", "\(esc))0", "\(esc))B", "\u{0e}", "\u{0f}"][next(6)]
+        case 22: text += next(2) == 0 ? "\(esc)H" : "\(esc)[\(next(2) == 0 ? 0 : 3)g"
+        case 23: text += "\(esc)]8;;https://x.test/\(next(5))\u{07}"
+        case 24: text += "\(esc)]8;;\u{07}"
+        case 25: text += "\(esc)]2;title \(next(9))\u{07}"
+        case 26: text += "\(esc)]7;file:///tmp/dir\(next(9))\u{07}"
+        case 27: text += next(2) == 0 ? "\(esc)]133;A\u{07}" : "\(esc)]133;D;\(next(3))\u{07}"
+        case 28: text += ["\(esc)[?1000h", "\(esc)[?1002h", "\(esc)[?1003h", "\(esc)[?9h",
+                          "\(esc)[?1000l", "\(esc)[?1006h", "\(esc)[?1006l", "\(esc)[?1004h",
+                          "\(esc)[?2004h", "\(esc)[?1007l", "\(esc)[?1007h"][next(11)]
+        case 29, 30: text += sgr()
+        case 31: text += ["\(esc)M", "\(esc)D", "\(esc)E"][next(3)]
+        case 32:
+            text += ["日本語", "한", "😀", "ｆｕ"][next(4)] + "\u{8}\u{8}"
+            if next(2) == 0 { text += "\(esc)[1K" }
+            text += words[next(words.count)]
+        default: text += words[next(words.count)] + String(repeating: "q", count: next(40))
+        }
+    }
+    let stream = Array(text.utf8)
+    let probe = "\(esc)8restored\t|\t|\u{0e}qqq\u{0f}qqq\(esc)[Hhome\(esc)[2S"
+        + String(repeating: "w", count: 30) + "\(esc)[?1047lprimary\(esc)[?6l\(esc)[Hend"
+
+    for (cols, rows) in [(80, 6), (13, 5), (2, 3)] {
+        let (source, _) = buffer(cols: cols, rows: rows)
+        let sourceParser = Parser()
+        sourceParser.sink = source
+        var mirrors: [(state: TerminalState, parser: Parser, from: Int)] = []
+        var problems: [String] = []
+        stream.withUnsafeBufferPointer { buf in
+            var off = 0, chunk = 0
+            while off < buf.count {
+                if chunk % 6 == 0 {
+                    let (m, mp) = mirror(of: source, sourceParser)
+                    if let d = difference(source, m) { problems.append("capture at read \(chunk): \(d)") }
+                    mirrors.append((m, mp, chunk))
+                }
+                let n = min(1 + next(700), buf.count - off)
+                let read = UnsafeBufferPointer(start: buf.baseAddress! + off, count: n)
+                sourceParser.feed(bytes: read)
+                for m in mirrors { m.parser.feed(bytes: read) }
+                off += n
+                chunk += 1
+            }
+        }
+        for m in mirrors {
+            if let d = difference(source, m.state) { problems.append("mirror from read \(m.from): \(d)") }
+        }
+        feed(sourceParser, probe)
+        for m in mirrors {
+            feed(m.parser, probe)
+            if let d = difference(source, m.state) { problems.append("mirror from read \(m.from), after the probe: \(d)") }
+        }
+        check("\(mirrors.count) mirrors started across a mixed stream end identical to it at \(cols) columns",
+              problems.isEmpty, problems.isEmpty ? "" : "\(problems.count) problems; first: \(problems[0])")
+    }
+}
+
+section("scrollback")
+do {
+    let (s, feed) = buffer(cols: 20, rows: 3, scrollback: 100)
+    for i in 1...10 { feed("line \(i)\r\n") }
+    check("rows that scroll off are kept", s.snapshot().scrollbackLines == 8,
+          "\(s.snapshot().scrollbackLines) lines")
+
+    let (r, rfeed) = buffer(cols: 20, rows: 3, scrollback: 2)
+    for i in 1...10 { rfeed("line \(i)\r\n") }
+    check("the ring stops at its configured size", r.snapshot().scrollbackLines == 2,
+          "\(r.snapshot().scrollbackLines) lines")
+
+    // The alt screen is vim's and htop's; what they scroll is theirs to lose.
+    let (a, afeed) = buffer(cols: 20, rows: 3, scrollback: 100)
+    afeed("\u{1b}[?1049h")
+    for i in 1...10 { afeed("alt \(i)\r\n") }
+    check("alt-screen scrolling files nothing", a.snapshot().scrollbackLines == 0,
+          "\(a.snapshot().scrollbackLines) lines")
+}
+
+section("erase")
+do {
+    let (s, feed) = buffer()
+    feed("hello\u{1b}[2J")
+    check("ED 2 clears the screen", row(s.snapshot(), 0).isEmpty)
+    check("ED 2 keeps the cleared screen in history", s.snapshot().scrollbackLines == 1,
+          "\(s.snapshot().scrollbackLines) lines")
+
+    // BCE: apps paint a band by setting a background and erasing across it.
+    let (b, bfeed) = buffer()
+    bfeed("\u{1b}[41m\u{1b}[2J")
+    check("erase paints the current SGR background",
+          b.snapshot().cells[0].bg == PackedColor(ThemeStore.currentTheme.ansi[1]))
+}
+
+section("a tab themed differently from the app")
+do {
+    // The case a profile theme override creates, and the one no code path had
+    // before it: the buffer's palette and the app's disagree.
+    let app = ThemeStore.currentTheme
+    let pinned = app.id == Theme.kuddoLight.id ? Theme.kuddoDark : Theme.kuddoLight
+    check("the checks below are not vacuous", app.foreground != pinned.foreground,
+          "app=\(app.name) pinned=\(pinned.name)")
+
+    let (s, feed) = buffer(theme: pinned)
+    feed("abc")
+    check("blanks beyond the text use the tab's background",
+          s.snapshot().cells[5].bg == PackedColor(pinned.background))
+
+    let (e, efeed) = buffer(theme: pinned)
+    efeed("abc\u{1b}[2J")
+    check("erased cells use the tab's default foreground",
+          e.snapshot().cells[0].fg == PackedColor(pinned.foreground),
+          "got \(e.snapshot().cells[0].fg), the app's is \(PackedColor(app.foreground))")
+
+    // The blank-row template and what `blankCells` writes have to come from
+    // the same palette, or nothing compares equal, every row looks like
+    // content, and each repaint files a screenful of nothing into history.
+    // Asserting on the *first* clear is what gives this teeth: after one pass
+    // every cell has been rewritten, so a consistently-wrong pair matches
+    // itself and a later clear looks fine.
+    let (f, ffeed) = buffer(rows: 4, theme: pinned)
+    ffeed("hello\u{1b}[2J")
+    check("clearing files the line that was on screen, not the whole grid",
+          f.snapshot().scrollbackLines == 1,
+          "filed \(f.snapshot().scrollbackLines) of 4 rows")
+
+    let (t, tfeed) = buffer(theme: pinned)
+    tfeed("hi")
+    t.applyThemeChange(from: pinned, to: app)
+    check("a theme change remaps the cells already printed",
+          t.snapshot().cells[0].fg == PackedColor(app.foreground))
+    check("and moves the palette the buffer paints in", t.theme.id == app.id)
+    tfeed("\u{1b}[2J")
+    check("so blanks after it use the new background",
+          t.snapshot().cells[0].bg == PackedColor(app.background))
+}
+
+section("a pane that repaints itself is not reflowed")
+do {
+    // tmux resizes the pane, the program repaints, and the repaint arrives a
+    // moment later. Re-wrapping our copy in between mangles every frame of a
+    // window drag — mid-word, as the recording of 2026-09-03 showed.
+    let state = TerminalState(cols: 20, rows: 4, scrollback: 50,
+                              reflowsOnResize: false)
+    let parser = Parser()
+    parser.sink = state
+    // 30 characters into a 20-column pane, so it genuinely wraps.
+    let text = "hello world and more text here"
+    Array(text.utf8).withUnsafeBufferPointer { parser.feed(bytes: $0) }
+    check("it wrapped on the way in",
+          row(state.snapshot(), 0) == "hello world and more"
+          && row(state.snapshot(), 1) == " text here",
+          "rows: \(row(state.snapshot(), 0).debugDescription), \(row(state.snapshot(), 1).debugDescription)")
+
+    state.resize(cols: 40, rows: 4)
+    check("widening leaves the halves where the program put them",
+          row(state.snapshot(), 0) == "hello world and more"
+          && row(state.snapshot(), 1) == " text here",
+          "rows: \(row(state.snapshot(), 0).debugDescription), \(row(state.snapshot(), 1).debugDescription)")
+
+    // An ordinary buffer must still reflow: that is what a shell wants, and
+    // what Kuddo has always done.
+    let (shell, feed) = buffer(cols: 20, rows: 4)
+    feed(text)
+    shell.resize(cols: 40, rows: 4)
+    check("an ordinary buffer still rejoins them",
+          row(shell.snapshot(), 0) == text,
+          "row 0 is \(row(shell.snapshot(), 0).debugDescription)")
+}
+
+section("reflow on resize")
+do {
+    let (s, feed) = buffer(cols: 8, rows: 4)
+    feed("hello world and more")
+    s.resize(cols: 20, rows: 4)
+    check("a wrapped line rejoins at the wider size",
+          row(s.snapshot(), 0) == "hello world and more",
+          "got \"\(row(s.snapshot(), 0))\"")
+    s.resize(cols: 8, rows: 4)
+    check("and re-splits on the way back", row(s.snapshot(), 0) == "hello wo",
+          "got \"\(row(s.snapshot(), 0))\"")
+}
+
+section("triggers")
+do {
+    // The store is not touched: it writes to the real triggers.json. What is
+    // worth pinning is the evaluator's contract, and that takes a list.
+    check("built-in ids are fixed, so \"switched off\" survives a relaunch",
+          Trigger.builtins.map(\.id) == [Trigger.urlID, Trigger.pathID])
+    check("and the builtins know themselves as built in",
+          Trigger.builtins.allSatisfy(\.isBuiltin))
+    check("a user trigger does not", !Trigger(name: "x", pattern: "x",
+                                              color: SIMD4(1, 1, 1, 1)).isBuiltin)
+
+    check("a broken pattern is reported, not swallowed",
+          TriggerStore.patternError("[unclosed") != nil)
+    check("a good one isn't", TriggerStore.patternError(#"\berror\b"# ) == nil)
+    check("and an empty one is not an error — it is a rule being typed",
+          TriggerStore.patternError("") == nil)
+
+    // `runCommand` carries a template, so it has to survive the round trip to
+    // disk that the other two cases don't exercise.
+    let t = Trigger(name: "Open in Preview", pattern: #"\S+\.png"#,
+                    color: SIMD4(1, 0.5, 0, 0.4), style: .background,
+                    clickAction: .runCommand("open -a Preview $1"))
+    let back = try! JSONDecoder().decode(Trigger.self, from: JSONEncoder().encode(t))
+    check("a trigger round-trips through JSON", back == t)
+    if case .runCommand(let cmd) = back.clickAction {
+        check("including its command template", cmd == "open -a Preview $1")
+    } else {
+        check("including its command template", false, "action decoded as \(String(describing: back.clickAction))")
+    }
+
+    let (state, feed) = buffer(cols: 40, rows: 3)
+    feed("see https://example.com/x for details")
+    let snap = state.snapshot()
+
+    let builtinsOnly = TriggerEvaluator(triggers: Trigger.builtins)
+    let urlMatch = builtinsOnly.evaluate(snapshot: snap).first { $0.trigger.id == Trigger.urlID }
+    check("the URL rule finds a URL", urlMatch?.text == "https://example.com/x",
+          "got \(urlMatch?.text ?? "nothing")")
+
+    // Ordering is the whole contract for user rules: TriggerStore.active puts
+    // them first precisely so a narrower rule can take a span off a builtin.
+    let mine = Trigger(name: "Example host", pattern: #"https://example\.com/\S*"#,
+                       color: SIMD4(1, 0, 0, 1), style: .background)
+    let userFirst = TriggerEvaluator(triggers: [mine] + Trigger.builtins)
+    let claimed = userFirst.evaluate(snapshot: snap).first { $0.text.contains("example.com") }
+    check("a user rule listed first claims the span off a builtin",
+          claimed?.trigger.id == mine.id,
+          "claimed by \(claimed?.trigger.name ?? "nothing")")
+
+    let builtinFirst = TriggerEvaluator(triggers: Trigger.builtins + [mine])
+    let claimed2 = builtinFirst.evaluate(snapshot: snap).first { $0.text.contains("example.com") }
+    check("and listed last it does not", claimed2?.trigger.id == Trigger.urlID)
+
+    let off = TriggerEvaluator(triggers: [Trigger(name: "Off", pattern: "details",
+                                                  color: SIMD4(1, 1, 1, 1),
+                                                  style: .background, enabled: false)])
+    check("a disabled rule is never compiled", off.evaluate(snapshot: snap).isEmpty)
+
+    // A path that ends a sentence. Claude Code prints inline code in its
+    // accent colour and the full stop after it plain; the colour is no help
+    // to the rule, which reads text alone.
+    func paths(_ line: String) -> [String] {
+        let (s, f) = buffer(cols: 60, rows: 2)
+        f(line)
+        return builtinsOnly.evaluate(snapshot: s.snapshot())
+            .filter { $0.trigger.id == Trigger.pathID }
+            .map(\.text)
+    }
+    let ends: [(String, String, [String])] = [
+        ("a path that ends a sentence leaves the full stop",
+         "see \u{1b}[38;2;177;185;249mscripts/statecheck.sh\u{1b}[39m.", ["scripts/statecheck.sh"]),
+        ("and an ellipsis", "then a/b/c...", ["a/b/c"]),
+        ("a line number keeps its digits", "in Sources/Foo.swift:393.", ["Sources/Foo.swift:393"]),
+        ("`../..` keeps its dots", "cd ../..", ["../.."]),
+        ("and so does `~/.`", "ls ~/.", ["~/."]),
+        ("a dot inside a name is still part of it", "open ~/.config/kuddo.json now", ["~/.config/kuddo.json"]),
+    ]
+    for (name, line, want) in ends {
+        let got = paths(line)
+        check(name, got == want, "got \(got)")
+    }
+
+    let broken = TriggerEvaluator(triggers: [Trigger(name: "Bad", pattern: "[unclosed",
+                                                     color: SIMD4(1, 1, 1, 1))]
+                                  + Trigger.builtins)
+    check("a rule that won't compile is skipped without taking the others down",
+          broken.evaluate(snapshot: snap).contains { $0.trigger.id == Trigger.urlID })
+}
+
+section("profiles")
+do {
+    // Decoding only — writing would go to the real profiles directory.
+    let minimal = try? JSONDecoder().decode(Profile.self, from: Data(#"{"name":"Minimal"}"#.utf8))
+    check("a hand-written profile needs only a name", minimal?.name == "Minimal")
+    check("an empty command means a login shell", minimal?.isPlainLoginShell == true)
+    check("and no directory means home", minimal?.startDirectory() == NSHomeDirectory())
+
+    let p = Profile(name: "Build", command: "/bin/bash -l", directory: "~/src",
+                    environment: ["FOO": "bar"])
+    let spec = p.launchSpec()
+    check("the command splits shell-style", spec.argv == ["/bin/bash", "-l"], "\(spec.argv)")
+    check("~ expands in the directory", spec.cwd == NSHomeDirectory() + "/src")
+    check("environment is passed as KEY=VALUE", spec.env == ["FOO=bar"])
+
+    check("quotes hold a word together",
+          ShellWords.split(#"echo "a b" c"#) == ["echo", "a b", "c"])
+    check("$HOME is left alone — this is exec'd, not sourced",
+          ShellWords.split("echo $HOME") == ["echo", "$HOME"])
+
+    let login = Profile(name: "Default").launchSpec()
+    check("a login shell gets the argv[0] convention", login.argv.first?.hasPrefix("-") == true,
+          "\(login.argv)")
+}
+
+section("device control strings")
+do {
+    // ESC P used to fall through as a plain ESC dispatch, so the payload
+    // printed as text: `tmux -CC` put a literal "1000p" on the screen.
+    let (state, feed) = buffer(cols: 20, rows: 3)
+    feed("\u{1b}P1000p%begin 1 2 3\r\n\u{1b}\\after")
+    check("a DCS payload is not printed as text",
+          row(state.snapshot(), 0) == "after",
+          "row 0 is \"\(row(state.snapshot(), 0))\"")
+
+    final class Recorder: ParserSink {
+        var text = ""
+        var starts: [(params: [Int], final: UInt8)] = []
+        var payload: [UInt8] = []
+        var ends = 0
+        func parserPrint(_ scalar: Unicode.Scalar) { text.unicodeScalars.append(scalar) }
+        func parserExecute(_ control: UInt8) {}
+        func parserCSI(_ p: [Int], marker: UInt8?, intermediates: [UInt8], final: UInt8) {}
+        func parserOSC(_ data: [UInt8], terminator: UInt8) {}
+        func parserESC(_ final: UInt8, intermediates: [UInt8]) {}
+        func parserDCSStart(_ params: [Int], intermediates: [UInt8], final: UInt8) {
+            starts.append((params, final))
+        }
+        func parserDCSPut(_ bytes: ArraySlice<UInt8>) { payload.append(contentsOf: bytes) }
+        func parserDCSEnd() { ends += 1 }
+    }
+
+    let recorder = Recorder()
+    let parser = Parser()
+    parser.sink = recorder
+    func send(_ s: String) {
+        Array(s.utf8).withUnsafeBufferPointer { parser.feed(bytes: $0) }
+    }
+    send("\u{1b}P1000p")
+    check("the introducer reports its parameter and final byte",
+          recorder.starts.first?.params == [1000]
+          && recorder.starts.first?.final == UInt8(ascii: "p"))
+    send("hello")
+    check("payload streams before any terminator arrives",
+          String(decoding: recorder.payload, as: UTF8.self) == "hello")
+    check("and the string is still open", recorder.ends == 0)
+
+    // The ordering that a naive implementation gets wrong: the trailing
+    // payload has to be delivered before the end, not after it.
+    recorder.payload = []
+    send(" world\u{1b}\\")
+    check("the last payload arrives before the end is reported",
+          String(decoding: recorder.payload, as: UTF8.self) == " world" && recorder.ends == 1)
+    send("visible")
+    check("text after the terminator prints again", recorder.text == "visible")
+}
+
+section("string sequences that are not OSC")
+do {
+    // Inside tmux, TERM goes screen-like and a shell starts setting the window
+    // name with `ESC k <name> ST`. oh-my-zsh sets it to the command it is
+    // about to run, so before this was handled, running `cd` printed a stray
+    // "cd" and running `claude` printed "claude" — at column 0, on the line
+    // after the prompt.
+    let (state, feed) = buffer(cols: 30, rows: 3)
+    feed("\u{1b}kcd\u{1b}\\ok")
+    check("a window name is not printed as text",
+          row(state.snapshot(), 0) == "ok",
+          "row 0 is \"\(row(state.snapshot(), 0))\"")
+    check("and it becomes the title", state.snapshot().title == "cd",
+          "title is \"\(state.snapshot().title)\"")
+
+    // The real thing, from a captured session: a truncated path, BEL-free,
+    // ST-terminated.
+    let (b2, f2) = buffer(cols: 40, rows: 3)
+    f2("\u{1b}k..fd/scratchpad\u{1b}\\$ ls")
+    check("the captured form leaves only the prompt",
+          row(b2.snapshot(), 0) == "$ ls", "row 0 is \"\(row(b2.snapshot(), 0))\"")
+    check("with the name as the title", b2.snapshot().title == "..fd/scratchpad")
+
+    // BEL terminates it too, the way it does an OSC.
+    let (b3, f3) = buffer(cols: 30, rows: 3)
+    f3("\u{1b}kbell\u{0007}after")
+    check("BEL ends a window name", row(b3.snapshot(), 0) == "after",
+          "row 0 is \"\(row(b3.snapshot(), 0))\"")
+
+    // APC, PM and SOS carry bodies nothing here reads. They must not print.
+    for (name, intro) in [("APC", "_"), ("PM", "^"), ("SOS", "X")] {
+        let (b, f) = buffer(cols: 30, rows: 3)
+        f("\u{1b}\(intro)secret payload\u{1b}\\visible")
+        check("\(name) payload is swallowed, not printed",
+              row(b.snapshot(), 0) == "visible",
+              "row 0 is \"\(row(b.snapshot(), 0))\"")
+    }
+}
+
+section("tmux control mode")
+do {
+    var events: [TmuxEvent] = []
+    let client = TmuxControlClient()
+    client.onEvent = { events.append($0) }
+    func send(_ s: String) { client.feed(Array(s.utf8)[...]) }
+
+    // Captured verbatim from `tmux -CC` 3.7c on attach.
+    send("%begin 1788417588 280 0\r\n%end 1788417588 280 0\r\n")
+    send("%window-add @0\r\n%sessions-changed\r\n%session-changed $0 0\r\n")
+    check("an empty reply block is reported with no lines",
+          events.first == .reply(id: 280, lines: [], error: false))
+    check("window-add is read", events.contains(.windowAdd(window: "@0")))
+    check("sessions-changed is read", events.contains(.sessionsChanged))
+    check("session-changed carries id and name",
+          events.contains(.sessionChanged(session: "$0", name: "0")))
+
+    events = []
+    send("%output %0 \\033[1mbold\\033[0m\r\n")
+    let expected = Array("\u{1b}[1mbold\u{1b}[0m".utf8)
+    check("octal escapes in %output are decoded",
+          events == [.output(pane: "%0", bytes: expected)],
+          "got \(events)")
+
+    events = []
+    send("%output %0 a\\134b\r\n")
+    check("an escaped backslash decodes to one backslash",
+          events == [.output(pane: "%0", bytes: Array("a\\b".utf8))])
+
+    events = []
+    send("%output %0 \\xzz mid\r\n")
+    check("a malformed escape loses one character, not the line",
+          events == [.output(pane: "%0", bytes: Array("\\xzz mid".utf8))],
+          "got \(events)")
+
+    // The transport splits wherever the PTY read landed, so a line arriving in
+    // pieces — including across the CRLF — has to survive.
+    events = []
+    send("%window-ren")
+    send("amed @1 my")
+    send(" window\r")
+    send("\n")
+    check("a line split across four chunks is reassembled",
+          events == [.windowRenamed(window: "@1", name: "my window")],
+          "got \(events)")
+
+    // A reply body may itself begin with '%': list-panes prints pane ids.
+    events = []
+    send("%begin 1 7 1\r\n%0: [80x24]\r\n%1: [80x24]\r\n%end 1 7 1\r\n")
+    check("a '%' line inside a block is payload, not a notification",
+          events == [.reply(id: 7, lines: ["%0: [80x24]", "%1: [80x24]"], error: false)],
+          "got \(events)")
+
+    events = []
+    send("%begin 1 8 1\r\nno such window\r\n%error 1 8 1\r\n")
+    check("an error block is flagged",
+          events == [.reply(id: 8, lines: ["no such window"], error: true)])
+
+    events = []
+    send("%window-pane-changed @1 %3\r\n")
+    check("the active pane change is read — it is what moves a tab's contents",
+          events == [.windowPaneChanged(window: "@1", pane: "%3")])
+
+    events = []
+    send("%unlinked-window-close @1\r\n")
+    check("an unlinked close counts as a close",
+          events == [.windowClose(window: "@1")])
+
+    events = []
+    send("%unlinked-window-add @42\r\n")
+    check("but an unlinked add does not count as an add",
+          events == [.other(name: "unlinked-window-add", arguments: "@42")],
+          "it is another session's window — got \(events)")
+
+    events = []
+    send("%exit \r\n")
+    send("%exit\r\n")
+    check("exit is read with or without a reason", events.count == 2)
+
+    events = []
+    send("%paste-buffer-changed buffer0\r\n")
+    check("an unhandled notification is surfaced rather than dropped",
+          events == [.other(name: "paste-buffer-changed", arguments: "buffer0")])
+
+    check("keys are sent as hex, which needs no quoting",
+          TmuxControlClient.hexKeys([0x1b, 0x5b, 0x41]) == "1b 5b 41")
+
+    // A block left open when tmux vanishes must not strand its caller.
+    events = []
+    send("%begin 1 9 1\r\npartial\r\n")
+    client.finish()
+    check("an unterminated block is closed as an error on teardown",
+          events == [.reply(id: 9, lines: ["partial"], error: true)])
+}
+
+section("tmux window-to-tab mapping")
+do {
+    final class Sink: TmuxPaneSink {
+        var received: [UInt8] = []
+        var closed = false
+        func receive(_ bytes: [UInt8]) { received.append(contentsOf: bytes) }
+        func transportClosed() { closed = true }
+        var text: String { String(decoding: received, as: UTF8.self) }
+    }
+    final class Host: TmuxControllerHost, TmuxCommandSink {
+        var sinks: [String: Sink] = [:]
+        var openOrder: [String] = []
+        var closed: [String] = []
+        var titles: [String: String] = [:]
+        var openedSizes: [(Int, Int)] = []
+        var selected: [String] = []
+        var ended = false
+        var commands: [String] = []
+        func tmuxOpenTab(windowID: String, title: String,
+                         cols: Int, rows: Int) -> TmuxPaneSink {
+            openedSizes.append((cols, rows))
+            let sink = Sink()
+            sinks[windowID] = sink
+            openOrder.append(windowID)
+            return sink
+        }
+        func tmuxCloseTab(windowID: String) { closed.append(windowID) }
+        func tmuxSetTabTitle(windowID: String, title: String) { titles[windowID] = title }
+        func tmuxSelectTab(windowID: String) { selected.append(windowID) }
+        func tmuxDidEnd() { ended = true }
+        func sendTmuxCommand(_ command: String) { commands.append(command) }
+    }
+
+    let host = Host()
+    let controller = TmuxController(host: host, commands: host)
+    controller.start(cols: 120, rows: 40)
+    check("attaching sizes the tmux client to the tab",
+          host.commands.contains("refresh-client -C 120x40"))
+    check("and asks for the windows that already exist",
+          host.commands.contains { $0.hasPrefix("list-windows") },
+          "%window-add only covers what changes after attach")
+
+    // Replayed in the order a real 3.7c session sent them.
+    controller.handle(.windowAdd(window: "@0"))
+    check("a window opens a tab", host.openOrder == ["@0"])
+    check("at the tmux client's size, not a placeholder",
+          host.openedSizes.first.map { $0 == (120, 40) } ?? false,
+          "opened at \(host.openedSizes)")
+    check("and asks tmux which panes it has",
+          host.commands.contains { $0.contains("list-panes -t @0") })
+    check("pane listing is scoped to this session, not the whole server",
+          host.commands.contains { $0.hasPrefix("list-panes -s") }
+          && !host.commands.contains { $0.hasPrefix("list-panes -a") },
+          "-a lists every session's panes and gives each window a tab")
+
+    // Output before we know where the pane lives — this is where a new
+    // window's first prompt arrives.
+    controller.handle(.output(pane: "%0", bytes: Array("early".utf8)))
+    check("output for an unplaced pane is held, not dropped",
+          host.sinks["@0"]?.text == "", "nothing should have been delivered yet")
+
+    controller.handle(.reply(id: 3, lines: ["kuddoP @0 %0 active"], error: false))
+    check("once the pane is placed, the held output is delivered",
+          host.sinks["@0"]?.text == "early", "got \"\(host.sinks["@0"]?.text ?? "")\"")
+
+    controller.handle(.output(pane: "%0", bytes: Array(" then".utf8)))
+    check("and later output follows it", host.sinks["@0"]?.text == "early then")
+
+    // A second pane in the same window: only the active one is shown.
+    controller.handle(.reply(id: 4, lines: ["kuddoP @0 %1"], error: false))
+    controller.handle(.output(pane: "%1", bytes: Array("hidden".utf8)))
+    check("a non-active pane's output does not reach the tab",
+          host.sinks["@0"]?.text == "early then",
+          "got \"\(host.sinks["@0"]?.text ?? "")\"")
+
+    controller.handle(.windowPaneChanged(window: "@0", pane: "%1"))
+    controller.handle(.output(pane: "%1", bytes: Array("now visible".utf8)))
+    check("switching the active pane switches what the tab shows",
+          host.sinks["@0"]?.text.hasSuffix("now visible") == true,
+          "got \"\(host.sinks["@0"]?.text ?? "")\"")
+
+    // Input goes to the pane the tab is showing, as hex.
+    host.commands = []
+    controller.sendKeys(window: "@0", bytes: [0x6c, 0x73, 0x0d])
+    check("keys go to the active pane as hex",
+          host.commands == ["send-keys -t %1 -H 6c 73 0d"],
+          "got \(host.commands)")
+
+    host.commands = []
+    controller.sendKeys(window: "@nope", bytes: [0x61])
+    check("keys for an unknown window go nowhere", host.commands.isEmpty)
+
+    // Renames and selection follow tmux.
+    controller.handle(.windowRenamed(window: "@0", name: "editor"))
+    check("a rename retitles the tab", host.titles["@0"] == "editor")
+    controller.handle(.windowAdd(window: "@1"))
+    controller.handle(.reply(id: 5, lines: ["kuddoP @1 %2 active"], error: false))
+    controller.handle(.sessionWindowChanged(session: "$0", window: "@1"))
+    check("tmux moving to another window selects that tab",
+          host.selected.last == "@1")
+
+    // Resize goes to the client, once per actual change.
+    host.commands = []
+    controller.setClientSize(cols: 100, rows: 30)
+    controller.setClientSize(cols: 100, rows: 30)
+    check("a resize is sent once, not per event",
+          host.commands == ["refresh-client -C 100x30"], "got \(host.commands)")
+
+    // Why the format strings carry a tag: tmux emits an unsolicited block on
+    // attach, so counting replies in order shifts everything by one, and
+    // sniffing the shape of the lines lets any '@' line invent a window.
+    host.openOrder = []
+    controller.handle(.reply(id: 99, lines: ["@7 not-a-window"], error: false))
+    check("an untagged reply cannot invent a window", host.openOrder.isEmpty)
+    controller.handle(.reply(id: 100, lines: ["0: zsh* (1 panes) [80x24]"], error: false))
+    check("nor can tmux's own attach block", host.openOrder.isEmpty)
+    // On attach, %window-add arrives before the list-windows reply, so a
+    // window is created with its id as a placeholder and named a moment
+    // later. Guarding that out left every tab titled "@0".
+    controller.handle(.reply(id: 101, lines: ["kuddoW @0 named by list"], error: false))
+    check("a name from list-windows reaches a tab that already exists",
+          host.titles["@0"] == "named by list", "got \(host.titles["@0"] ?? "nil")")
+    controller.handle(.reply(id: 102, lines: ["kuddoW @0 @0"], error: false))
+    check("but the id placeholder cannot overwrite a real name",
+          host.titles["@0"] == "named by list", "got \(host.titles["@0"] ?? "nil")")
+
+    // Closing.
+    controller.handle(.windowClose(window: "@1"))
+    check("closing a window closes its tab", host.closed.contains("@1"))
+    check("and the sink is told", host.sinks["@1"]?.closed == true)
+
+    // A window in another session must not appear here. tmux says so
+    // explicitly: %unlinked-window-add is "not linked to the current session".
+    host.openOrder = []
+    controller.handle(.other(name: "unlinked-window-add", arguments: "@42"))
+    check("another session's window gets no tab", host.openOrder.isEmpty)
+
+    controller.handle(.exit(reason: ""))
+    check("exit closes what is left", host.closed.contains("@0"))
+    check("and reports the mode is over", host.ended)
+    check("the last window's sink is closed too", host.sinks["@0"]?.closed == true)
+
+    // Nothing should be acted on after the end.
+    host.openOrder = []
+    controller.handle(.windowAdd(window: "@9"))
+    check("events after exit are ignored", host.openOrder.isEmpty)
+}
+
+section("settings search")
+do {
+    // The index is also the Tab order, so a gap here is a control nobody can
+    // reach with the keyboard, not just one search can't find.
+    check("every pane has indexed controls",
+          SettingsCategory.allCases.allSatisfy { !SettingsIndex.fields(in: $0).isEmpty })
+    let fields = SettingsIndex.all.map(\.field)
+    check("no control is indexed twice", Set(fields).count == fields.count)
+    check("fields(in:) keeps the index's order",
+          SettingsIndex.fields(in: .general).first == .warnOnClose)
+    check("and covers only its own pane",
+          SettingsIndex.fields(in: .notifications).allSatisfy {
+              [.notificationsEnabled, .notifyOnBell, .notifyOnlyWhenUnfocused].contains($0)
+          })
+
+    check("an empty query matches nothing", SettingsIndex.search("").isEmpty)
+    check("whitespace is not a query", SettingsIndex.search("   ").isEmpty)
+    check("nonsense matches nothing", SettingsIndex.search("zzzzq").isEmpty)
+
+    // Ranking is the point: a label match has to beat a pane-name match, or
+    // "font" leads with whatever happens to sit in a matching pane.
+    let font = SettingsIndex.search("font")
+    check("\"font\" leads with the font controls",
+          font.first?.field == .fontFamily && font.dropFirst().first?.field == .fontSize,
+          "got \(font.prefix(2).map(\.label))")
+
+    check("search is case-insensitive",
+          SettingsIndex.search("FONT").map(\.field) == font.map(\.field))
+
+    // Keyword-only hits: the word someone arrives with is rarely the label.
+    check("\"antialiasing\" finds stroke weight",
+          SettingsIndex.search("antialiasing").first?.field == .strokeWeight)
+    check("\"history\" finds the scrollback depth",
+          SettingsIndex.search("history").first?.field == .scrollbackLines)
+    check("\"osc\" finds shell integration",
+          SettingsIndex.search("osc").first?.field == .shellIntegration)
+    check("\"regex\" finds the trigger pattern",
+          SettingsIndex.search("regex").contains { $0.field == .triggerPattern })
+
+    // A word inside a long label should rank as well as its first word does.
+    check("\"closing\" finds the close warning",
+          SettingsIndex.search("closing").first?.field == .warnOnClose)
+    check("\"bell\" finds the bell toggle",
+          SettingsIndex.search("bell").first?.field == .notifyOnBell)
+
+    // The two settings that had no UI at all until now.
+    check("the scrollback depth is reachable",
+          SettingsIndex.fields(in: .general).contains(.scrollbackLines))
+    check("so is shell integration",
+          SettingsIndex.fields(in: .general).contains(.shellIntegration))
+}
+
+section("saved state")
+do {
+    let saved = SavedState(tabs: [SavedTab(cwd: "/tmp", profileId: "ABC"), SavedTab(cwd: nil)],
+                           isFullScreen: true, windowFrame: nil)
+    let back = try! JSONDecoder().decode(SavedState.self, from: JSONEncoder().encode(saved))
+    check("a tab remembers its profile", back.tabs[0].profileId == "ABC")
+    check("a plain ⌘T tab has none", back.tabs[1].profileId == nil)
+    check("full-screen survives", back.isFullScreen)
+
+    let legacy = try? JSONDecoder().decode(
+        SavedState.self, from: Data(#"{"tabs":[{"cwd":"/tmp"}],"isFullScreen":false}"#.utf8))
+    check("a state.json written before profiles still loads", legacy?.tabs.count == 1)
+    check("and its tabs take the default profile", legacy?.tabs[0].profileId == nil)
+}
+
+section("key encoding")
+do {
+    // KeyEncoder is what a keystroke becomes on the wire, on every host. It was
+    // lifted out of TerminalView's NSEvent handling, and a remote client has to
+    // produce exactly these bytes or the shell behaves differently than it does
+    // at the Mac's own keyboard — so every branch is pinned here.
+    func wire(_ chord: KeyChord) -> String {
+        String(decoding: KeyEncoder.bytes(for: chord), as: UTF8.self)
+    }
+    func key(_ special: KeyChord.Special, _ mods: KeyModifiers = []) -> String {
+        wire(KeyChord(special: special, modifiers: mods))
+    }
+    func text(_ chars: String?, bare: String? = nil, _ mods: KeyModifiers = []) -> String {
+        wire(KeyChord(characters: chars, charactersIgnoringModifiers: bare ?? chars, modifiers: mods))
+    }
+    let esc = "\u{1B}"
+
+    check("enter is CR", key(.enter) == "\r")
+    check("shift-enter is ESC CR, so a TUI can tell newline from submit",
+          key(.enter, [.shift]) == esc + "\r")
+    check("and so is option-enter", key(.enter, [.option]) == esc + "\r")
+    check("backspace is DEL", key(.backspace) == "\u{7F}")
+    check("option-backspace deletes a word", key(.backspace, [.option]) == esc + "\u{7F}")
+    check("forward delete is CSI 3 ~", key(.forwardDelete) == esc + "[3~")
+    check("tab is HT", key(.tab) == "\t")
+    check("shift-tab is CSI Z", key(.tab, [.shift]) == esc + "[Z")
+    check("escape is ESC", key(.escape) == esc)
+
+    check("arrows are CSI A–D", [key(.up), key(.down), key(.right), key(.left)]
+          == [esc + "[A", esc + "[B", esc + "[C", esc + "[D"])
+    check("modified arrows carry xterm's 1 + shift + 2·option + 4·control",
+          key(.up, [.control]) == esc + "[1;5A" && key(.down, [.shift]) == esc + "[1;2B")
+    check("all three at once is 8", key(.up, [.shift, .option, .control]) == esc + "[1;8A")
+    check("option-left and option-right move by word instead",
+          key(.left, [.option]) == esc + "b" && key(.right, [.option]) == esc + "f")
+    check("but option-up is still a modified arrow", key(.up, [.option]) == esc + "[1;3A")
+    check("home, end, page up, page down",
+          [key(.home), key(.end), key(.pageUp), key(.pageDown)]
+          == [esc + "[H", esc + "[F", esc + "[5~", esc + "[6~"])
+
+    check("command-anything is an app shortcut, never input",
+          text("c", [.command]).isEmpty && key(.enter, [.command]).isEmpty)
+
+    check("option is meta: ESC before the bare key", text("∫", bare: "b", [.option]) == esc + "b")
+    check("meta lowercases unless shift is held",
+          text("B", bare: "B", [.option]) == esc + "b"
+          && text("B", bare: "B", [.option, .shift]) == esc + "B")
+    check("meta with no bare key sends nothing", text("x", bare: "", [.option]).isEmpty)
+
+    check("ordinary text passes through", text("a") == "a")
+    check("control letters arrive already as the control byte", text("\u{03}", [.control]) == "\u{03}")
+    check("text is UTF-8", KeyEncoder.bytes(for: KeyChord(characters: "é")) == [0xC3, 0xA9])
+    check("no characters, no bytes", text(nil).isEmpty)
+}
+
+section("command blocks")
+do {
+    // The shape a markdown-rendering TUI prints: prose, a blank line, a
+    // command over several lines, a blank line, another command. Nothing in
+    // the bytes says which is which — that is the whole problem — so the
+    // detector has only the blank lines and the first line's content to work
+    // from.
+    let (state, feed) = buffer(cols: 60, rows: 14)
+    feed("  Two edits to the live Deployment. Order matters:\r\n")
+    feed("\r\n")
+    feed("  kubectl -n ahead patch deploy app --type=json -p '[{\r\n")
+    feed("    \"path\": \"/spec/template/spec/containers/0/env/0\",\r\n")
+    feed("    \"value\": {\"name\": \"REDIS_PASSWORD\"}}]'\r\n")
+    feed("\r\n")
+    feed("  kubectl -n ahead set env deploy/app \\\r\n")
+    feed("    'ConnectionStrings__Redis=cache:6379'\r\n")
+    let snap = state.snapshot()
+    let installed: (String) -> Bool = { $0 == "kubectl" }
+    func blockAt(_ r: Int) -> CommandBlock? {
+        CommandBlockDetector.block(containingRow: r, snapshot: snap, isExecutable: installed)
+    }
+
+    check("a command block is found from any of its rows",
+          blockAt(2)?.firstRow == 2 && blockAt(3)?.firstRow == 2 && blockAt(4)?.firstRow == 2)
+    check("and it ends at the blank line", blockAt(3)?.lastRow == 4)
+    check("the prose paragraph above is not one", blockAt(0) == nil)
+    check("nor is a blank row", blockAt(1) == nil)
+    check("the second command is its own block",
+          blockAt(6)?.firstRow == 6 && blockAt(6)?.lastRow == 7)
+
+    check("the copied text drops the block's common indent",
+          blockAt(3)?.text.hasPrefix("kubectl -n ahead patch") == true,
+          blockAt(3).map { String($0.text.prefix(24)) } ?? "nil")
+    check("but keeps the indent inside it",
+          blockAt(3)?.text.contains("\n  \"path\"") == true)
+    check("and trims the row padding",
+          blockAt(3)?.text.contains("  \n") == false && blockAt(3)?.text.hasSuffix(" ") == false)
+    check("a trailing continuation backslash survives",
+          blockAt(6)?.text.contains("deploy/app \\\n") == true)
+
+    // A gutter bullet is the renderer talking, not part of the command.
+    let (bulleted, feedBullet) = buffer(cols: 40, rows: 6)
+    feedBullet("\u{23FA} kubectl get pods\r\n")
+    feedBullet("    --namespace ahead\r\n")
+    let bulletBlock = CommandBlockDetector.block(containingRow: 0,
+                                                 snapshot: bulleted.snapshot(),
+                                                 isExecutable: installed)
+    check("the bullet in front of a block is not copied",
+          bulletBlock?.text == "kubectl get pods\n  --namespace ahead",
+          bulletBlock.map { $0.text.debugDescription } ?? "nil")
+
+    // A command too long for the window is still one command.
+    let (narrow, feedNarrow) = buffer(cols: 20, rows: 6)
+    feedNarrow("kubectl get pods --all-namespaces\r\n")
+    let wrapped = CommandBlockDetector.block(containingRow: 1,
+                                             snapshot: narrow.snapshot(),
+                                             isExecutable: installed)
+    check("a wrapped command is copied without the wrap",
+          wrapped?.text == "kubectl get pods --all-namespaces",
+          wrapped.map { $0.text.debugDescription } ?? "nil")
+    check("and marking covers every row it wrapped onto",
+          wrapped?.firstRow == 0 && wrapped?.lastRow == 1)
+
+    // A wall of output is not a command block, whatever its first line says.
+    let (wall, feedWall) = buffer(cols: 30, rows: 60, scrollback: 0)
+    feedWall("kubectl logs -f pod\r\n")
+    for i in 0..<50 { feedWall("line \(i) of output\r\n") }
+    check("a wall of unbroken output is left alone",
+          CommandBlockDetector.block(containingRow: 3, snapshot: wall.snapshot(),
+                                     isExecutable: installed) == nil)
+
+    // The gate itself.
+    let none: (String) -> Bool = { _ in false }
+    check("an installed tool is a command",
+          CommandBlockDetector.looksLikeCommand("npm test", isExecutable: { $0 == "npm" }))
+    check("a tool you don't have is still one if it carries a flag",
+          CommandBlockDetector.looksLikeCommand("terraform apply -auto-approve", isExecutable: none))
+    check("a tool you don't have with no flag is not",
+          !CommandBlockDetector.looksLikeCommand("pulumi up", isExecutable: none))
+    check("prose is not a command",
+          !CommandBlockDetector.looksLikeCommand("Two edits to the live Deployment.", isExecutable: none))
+    check("a prompt in front of the command is not the command",
+          CommandBlockDetector.looksLikeCommand("$ kubectl get pods", isExecutable: { $0 == "kubectl" }))
+    check("nor are the environment assignments before it",
+          CommandBlockDetector.looksLikeCommand("LOG=debug RUST_BACKTRACE=1 myapp", isExecutable: { $0 == "myapp" }))
+    check("sudo is not the command either",
+          CommandBlockDetector.looksLikeCommand("sudo systemctl restart nginx", isExecutable: { $0 == "systemctl" }))
+    check("a pipeline counts", CommandBlockDetector.looksLikeCommand("cat x | grep y", isExecutable: none))
+
+    // A transcript is a command followed by what it printed. Copying the
+    // output back into a shell is never the ask, and neither is the prompt.
+    let (transcript, feedTranscript) = buffer(cols: 70, rows: 6)
+    feedTranscript("$ kubectl rollout restart deployment/payments-api -n payments\r\n")
+    feedTranscript("deployment.apps/payments-api restarted\r\n")
+    let tSnap = transcript.snapshot()
+    let cmdOnly = CommandBlockDetector.block(containingRow: 0, snapshot: tSnap, isExecutable: installed)
+    check("a prompted command stops before its output", cmdOnly?.lastRow == 0)
+    check("and the prompt is not copied with it",
+          cmdOnly?.text == "kubectl rollout restart deployment/payments-api -n payments",
+          cmdOnly.map { $0.text.debugDescription } ?? "nil")
+    check("pointing at the output is not pointing at the command",
+          CommandBlockDetector.block(containingRow: 1, snapshot: tSnap, isExecutable: installed) == nil)
+
+    // …but a command that continues onto the next lines is still one command.
+    let (cont, feedCont) = buffer(cols: 80, rows: 8)
+    feedCont("$ kubectl create secret generic payments-db-credentials \\\r\n")
+    feedCont("    --from-literal=DB_USER=payments_svc \\\r\n")
+    feedCont("    --dry-run=client -o yaml | kubectl apply -f -\r\n")
+    feedCont("secret/payments-db-credentials created\r\n")
+    let contBlock = CommandBlockDetector.block(containingRow: 1, snapshot: cont.snapshot(),
+                                               isExecutable: installed)
+    check("continuation lines stay with the command", contBlock?.lastRow == 2)
+    check("the backslashes survive the copy",
+          contBlock?.text.hasPrefix("kubectl create secret generic payments-db-credentials \\\n") == true,
+          contBlock.map { String($0.text.prefix(60)).debugDescription } ?? "nil")
+    check("and the output after it is left out",
+          contBlock?.text.contains("created") == false)
+
+    // `#` is a comment far more often than it is a root prompt.
+    check("a comment keeps its hash",
+          CommandBlockDetector.strippingPrompt("# rotate the credentials") == nil)
+    check("a variable is not a prompt", CommandBlockDetector.strippingPrompt("$PATH is set") == nil)
+    check("a prompt is a sigil and a space",
+          CommandBlockDetector.strippingPrompt("$ npm test") == "npm test")
+
+    // How a TUI actually prints a list of commands: a numbered heading, then
+    // the command, no blank line between them. The run holds both, so the
+    // heading has to be split off or nothing is a target at all.
+    let (list, feedList) = buffer(cols: 80, rows: 12)
+    feedList(" 1. Recreate the whole secret with new values (idempotent)\r\n")
+    feedList("  kubectl create secret generic moonbase-db-creds \\\r\n")
+    feedList("    --from-literal=DB_USER=astro_admin \\\r\n")
+    feedList("    --dry-run=client -o yaml | kubectl apply -f -\r\n")
+    feedList("\r\n")
+    feedList("  7. Restart the pods so they pick up the new values\r\n")
+    feedList("  kubectl rollout restart deployment/moonbase-api -n lunar-prod\r\n")
+    feedList("  kubectl rollout status deployment/moonbase-api -n lunar-prod\r\n")
+    let lSnap = list.snapshot()
+    func listBlock(_ r: Int) -> CommandBlock? {
+        CommandBlockDetector.block(containingRow: r, snapshot: lSnap, isExecutable: installed)
+    }
+    check("a command under a heading is still found", listBlock(1)?.firstRow == 1)
+    check("and the heading is not part of it", listBlock(1)?.lastRow == 3)
+    check("the heading itself is not a target", listBlock(0) == nil)
+    check("the copy starts at the command",
+          listBlock(2)?.text.hasPrefix("kubectl create secret") == true,
+          listBlock(2).map { String($0.text.prefix(30)).debugDescription } ?? "nil")
+    check("two commands in a row are one block",
+          listBlock(6)?.firstRow == 6 && listBlock(6)?.lastRow == 7)
+    check("and both are copied",
+          listBlock(7)?.text.contains("rollout restart") == true
+            && listBlock(7)?.text.contains("rollout status") == true)
+
+    // Not every command runs on with a backslash. A JSON payload just ends
+    // mid-quote, and half of it is worse than none.
+    check("an unclosed quote keeps the command going",
+          CommandBlockDetector.isIncomplete("kubectl patch -p '[{\"op\":\"add\","))
+    check("an unclosed brace does too",
+          CommandBlockDetector.isIncomplete("foo --data {\"a\": 1"))
+    check("a finished command does not",
+          !CommandBlockDetector.isIncomplete("kubectl get pods -n prod"))
+    check("an apostrophe inside double quotes is not an open quote",
+          !CommandBlockDetector.isIncomplete("echo \"don't\""))
+    check("an escaped quote is not an open quote",
+          !CommandBlockDetector.isIncomplete("echo \\\"x\\\""))
+
+    // A flag only counts near the front of the line. Prose that mentions one
+    // arrives at it late — this is a real line from a Claude Code screen, the
+    // echo of a prompt, and it was marked as a command until the lookahead.
+    check("a sentence that mentions a flag is not a command",
+          !CommandBlockDetector.looksLikeCommand(
+            "two spaces indent saying --namespace ahead, then echo done.", isExecutable: none))
+    check("but a subcommand before the flag still is",
+          CommandBlockDetector.looksLikeCommand(
+            "aws ec2 describe-instances --region us-east-1", isExecutable: none))
+    check("and a flag right after the command name certainly is",
+          CommandBlockDetector.looksLikeCommand("terraform apply -auto-approve", isExecutable: none))
+
+    // A heredoc's body is its argument. Copying the opener alone gives a
+    // command that sits waiting on stdin, which is worse than copying nothing.
+    check("a quoted heredoc delimiter is read",
+          CommandBlockDetector.heredocDelimiter("cat <<'EOF' | kubectl apply -f -") == "EOF")
+    check("so is a bare one", CommandBlockDetector.heredocDelimiter("cat <<EOF") == "EOF")
+    check("and a dashed, double-quoted one",
+          CommandBlockDetector.heredocDelimiter("cat <<-\"END\" > f") == "END")
+    check("a command with no heredoc has no delimiter",
+          CommandBlockDetector.heredocDelimiter("kubectl get pods -n prod") == nil)
+
+    let (here, feedHere) = buffer(cols: 70, rows: 14)
+    feedHere(" 5. Update from a heredoc\r\n")
+    feedHere("  cat <<'EOF' | kubectl apply -f -\r\n")
+    feedHere("  apiVersion: v1\r\n")
+    feedHere("  metadata:\r\n")
+    feedHere("    name: stripe-api\r\n")
+    feedHere("\r\n")                       // a body may contain blank lines
+    feedHere("  type: Opaque\r\n")
+    feedHere("  EOF\r\n")
+    feedHere("secret/stripe-api configured\r\n")
+    let hSnap = here.snapshot()
+    func hereBlock(_ r: Int) -> CommandBlock? {
+        CommandBlockDetector.block(containingRow: r, snapshot: hSnap, isExecutable: installed)
+    }
+    check("a heredoc runs to its terminator",
+          hereBlock(1)?.firstRow == 1 && hereBlock(1)?.lastRow == 7,
+          hereBlock(1).map { "\($0.firstRow)-\($0.lastRow)" } ?? "nil")
+    check("a blank line inside the body does not end it",
+          hereBlock(6)?.firstRow == 1 && hereBlock(6)?.lastRow == 7)
+    check("pointing anywhere in the body finds the same command",
+          hereBlock(4)?.text == hereBlock(1)?.text)
+    check("the terminator is copied, at column 0 where a shell needs it",
+          hereBlock(1)?.text.hasSuffix("\nEOF") == true,
+          hereBlock(1).map { String($0.text.suffix(18)).debugDescription } ?? "nil")
+    check("the body keeps its own indentation",
+          hereBlock(1)?.text.contains("\n  name: stripe-api") == true)
+    check("what the command printed is not part of it",
+          hereBlock(1)?.text.contains("configured") == false)
+    check("and that output line is not a target of its own",
+          hereBlock(8) == nil)
+
+    // Claude Code shows the command it ran cut short, so a heredoc it wrote
+    // arrives with no terminator on screen. This is a real screen: holding ⌘
+    // anywhere below the opener marked everything from it to the status
+    // line as one command.
+    let (cut, feedCut) = buffer(cols: 120, rows: 22)
+    feedCut("● Bash(cat > /private/tmp/claude-501/scratchpad/icon-msg.txt <<'EOF'\r\n")
+    feedCut("      Replace the rising line with first…)\r\n")
+    feedCut("  ⎿  Error: Exit code 128\r\n")
+    feedCut("     fatal: pathspec 'ios/Ahead/App/RootView.swift' did not match any files\r\n")
+    feedCut("\r\n")
+    feedCut("● zsh doesn't split $FILES into words, so the add failed. Retrying with an array.\r\n")
+    feedCut("\r\n")
+    feedCut("● Bash(files=(ios/Ahead/App/RootView.swift ios/Ahead/Core/Components/Chrome.swift…)\r\n")
+    feedCut("  ⎿  32614e3 Replace the rising line with first light\r\n")
+    feedCut("\r\n")
+    feedCut("      ios/Ahead/App/RootView.swift                       |   3 +-\r\n")
+    feedCut("      ios/Ahead/Resources/AppIcon.png                    | Bin 81243 -> 64012 bytes\r\n")
+    feedCut("     … +14 lines (ctrl+o to expand)\r\n")
+    feedCut("  ⎿  Allowed by auto mode classifier\r\n")
+    feedCut("\r\n")
+    feedCut("● I committed the new icon to main as 32614e3 and pushed it to origin.\r\n")
+    let cutSnap = cut.snapshot()
+    let git: (String) -> Bool = { $0 == "cat" || $0 == "git" }
+    let cutBlocks = (0..<16).compactMap {
+        CommandBlockDetector.block(containingRow: $0, snapshot: cutSnap, isExecutable: git)
+    }
+    check("a heredoc with no terminator on screen is not a target",
+          cutBlocks.isEmpty,
+          cutBlocks.map { "\($0.firstRow)-\($0.lastRow)" }.joined(separator: " "))
+    check("a diffstat's bar is not a pipe",
+          !CommandBlockDetector.looksLikeCommand(
+            "ios/Ahead/App/RootView.swift                       |   3 +-", isExecutable: git)
+            && !CommandBlockDetector.looksLikeCommand(
+            "AppIcon.png | Bin 81243 -> 64012 bytes", isExecutable: git))
+
+    // A TUI that runs commands for you echoes them behind a marker. Claude
+    // Code's bash mode uses `!`, and `!` pasted into an interactive shell is
+    // history expansion rather than the command that was on screen.
+    check("a bash-mode bang is a prompt",
+          CommandBlockDetector.strippingPrompt("! ssh host uptime") == "ssh host uptime")
+    check("and the command behind it is judged, not the bang",
+          CommandBlockDetector.looksLikeCommand("! ssh host uptime",
+                                                isExecutable: { $0 == "ssh" }))
+
+    let (bang, feedBang) = buffer(cols: 80, rows: 8)
+    feedBang("! ssh ovhprod-001 'kubectl -n snuggery get pvc -o jsonpath=\"{.a} {.b}\"'\r\n")
+    feedBang("2026-09-23T10:02:11Z [kubernetes.io/pvc-protection]\r\n")
+    let bangSnap = bang.snapshot()
+    let bangBlock = CommandBlockDetector.block(containingRow: 0, snapshot: bangSnap,
+                                               isExecutable: { $0 == "ssh" })
+    check("the bang is not copied with the command",
+          bangBlock?.text.hasPrefix("ssh ovhprod-001") == true,
+          bangBlock.map { String($0.text.prefix(24)).debugDescription } ?? "nil")
+    check("and what it printed is not either",
+          bangBlock?.text.contains("pvc-protection") == false)
+    check("braces inside a single-quoted argument do not leave it unfinished",
+          !CommandBlockDetector.isIncomplete(
+            "ssh h 'kubectl -o jsonpath=\"{.a} {.b}\"; echo'"))
+
+    // `at`, `test`, `time`, `make`, `find`, `date` are English words as well as
+    // commands, so a wrapped sentence can open with one. Inside a paragraph the
+    // name proves nothing; at the start of a block it is all there is to go on.
+    let isAt: (String) -> Bool = { $0 == "at" }
+    check("an English word that is also a command is not one mid-paragraph",
+          !CommandBlockDetector.looksLikeCommand(
+            "at ssh. The bang is how Claude Code showed the command it ran",
+            isExecutable: isAt, requiringSyntax: true))
+    check("the same name opening a block still counts",
+          CommandBlockDetector.looksLikeCommand("at 09:00 tomorrow", isExecutable: isAt))
+    check("and mid-paragraph it counts once there is shell in the line",
+          CommandBlockDetector.looksLikeCommand("at -f job.sh 09:00",
+                                                isExecutable: isAt, requiringSyntax: true))
+
+    let (prose, feedProse) = buffer(cols: 78, rows: 6)
+    feedProse("  ⌘-hover the command: it tints even though it wrapped, and the copy starts\r\n")
+    feedProse("  at ssh. The bang is how Claude Code showed the command it ran.\r\n")
+    check("a wrapped note is not a command block",
+          CommandBlockDetector.block(containingRow: 1, snapshot: prose.snapshot(),
+                                     isExecutable: isAt) == nil)
+}
+
+section("coloured runs")
+do {
+    // Every case here is a byte stream seen in the wild or copied from it:
+    // what Claude Code prints for a quoted draft, and what `ls -G` prints.
+    let fg = PackedColor(ThemeStore.currentTheme.foreground)
+    func run(_ s: TerminalSnapshot, _ col: Int, _ row: Int) -> ColorRun? {
+        ColorRunDetector.run(at: (col, row), snapshot: s, defaultForeground: fg)
+    }
+    let accent = "\u{1b}[38;2;87;105;247m", plain = "\u{1b}[39m"
+    // Claude Code colours each word and leaves the spaces between them in the
+    // default colour — a space's foreground never shows.
+    func perWord(_ line: String) -> String {
+        line.split(separator: " ").map { "\(accent)\($0)\(plain)" }.joined(separator: " ")
+    }
+
+    // A draft Claude Code wrapped itself at 38 columns of a 40-column screen:
+    // three rows with no wrap flag between them.
+    let (draft, feedDraft) = buffer(cols: 40, rows: 6)
+    feedDraft("\u{1b}[1mdescribe\u{1b}[22m (99 of 100)\r\n")
+    feedDraft("  \(perWord("Kuddo is a native macOS terminal"))\r\n")
+    feedDraft("  \(perWord("emulator with an AppKit interface and"))\r\n")
+    feedDraft("  \(perWord("a Metal renderer."))\r\n")
+    feedDraft("  see \(accent)Sources\(plain) for more\r\n")
+    let whole = "Kuddo is a native macOS terminal emulator with an AppKit interface and a Metal renderer."
+    let ds = draft.snapshot()
+    check("a word of a wrapped draft copies the whole draft", run(ds, 12, 2)?.text == whole,
+          run(ds, 12, 2)?.text ?? "nil")
+    check("as one segment per row", run(ds, 12, 2)?.segments.count == 3)
+    check("the default-coloured space between two words is part of it",
+          run(ds, 7, 1)?.text == whole)
+    check("a coloured word inside plain prose copies alone", run(ds, 8, 4)?.text == "Sources")
+    check("plain text is not a target", run(ds, 3, 4) == nil)
+    check("nor the padding past a draft", run(ds, 30, 3) == nil)
+
+    // `ls -1`: short rows of the same colour weren't wrapped, so they stay apart.
+    let (column, feedColumn) = buffer(cols: 40, rows: 4)
+    feedColumn("\(accent)Sources\(plain)\r\n\(accent)docs\(plain)\r\n\(accent)scripts\(plain)\r\n")
+    check("a column of names copies one name", run(column.snapshot(), 1, 1)?.text == "docs")
+
+    // `ls -G -C`, byte for byte: one space after the longest name, and a
+    // wider gap between the others, which is what gives the columns away.
+    let (listing, feedListing) = buffer(cols: 80, rows: 2)
+    let dir = "\u{1b}[1m\u{1b}[36m", end = "\u{1b}[39;49m\u{1b}[0m"
+    feedListing("\(dir)CKuddoBridge\(end) \(dir)Kuddo\(end)        \(dir)KuddoApp\(end)\r\n")
+    let ls = listing.snapshot()
+    check("ls columns don't bridge the single space after the longest name",
+          run(ls, 3, 0)?.text == "CKuddoBridge", run(ls, 3, 0)?.text ?? "nil")
+    check("and that space is not a target", run(ls, 12, 0) == nil)
+
+    // A full-width rule passes the fit test; it must not fuse with a line in
+    // its colour under it.
+    let (rule, feedRule) = buffer(cols: 20, rows: 3)
+    feedRule("\(accent)\(String(repeating: "─", count: 20))\(plain)\r\n\(perWord("Allowed by rule"))\r\n")
+    check("a rule is not a target", run(rule.snapshot(), 5, 0) == nil)
+    check("nor fused with the line under it", run(rule.snapshot(), 3, 1)?.text == "Allowed by rule")
+
+    // Claude Code's footer, byte for byte from a capture, plus the artifact
+    // pill in both its states: a dim name, and all in the accent after the
+    // artifact failed to open. None of it is text to copy.
+    for theme in [Theme.kuddoDark, Theme.kuddoLight, Theme.pencilLight] {
+        let (footer, feedFooter) = buffer(cols: 80, rows: 4, theme: theme)
+        let grey = "\u{1b}[38;2;102;102;102m", amber = "\u{1b}[38;2;150;108;30m"
+        let claude = "\u{1b}[38;2;215;119;87m"
+        feedFooter("\u{1b}[3G\(amber)⏵⏵\u{1b}[6Gauto\u{1b}[11Gmode\u{1b}[16Gon")
+        feedFooter("\(grey) (shift+tab\u{1b}[30Gto\u{1b}[33Gcycle)\(plain)\r\n")
+        feedFooter("  \(claude)⧉\(plain) \u{1b}[2mlink-check\u{1b}[22m\r\n")
+        feedFooter("  \(claude)⧉ link-check\(plain)\r\n")
+        feedFooter("\(grey)Claude Code v2.1.285\(plain)\r\n")
+        let fs = footer.snapshot()
+        let tfg = PackedColor(theme.foreground)
+        func frun(_ col: Int, _ row: Int) -> ColorRun? {
+            ColorRunDetector.run(at: (col, row), snapshot: fs, defaultForeground: tfg)
+        }
+        let name = theme.name
+        check("\(name): the grey \"(shift+tab to cycle)\" is not a target", frun(24, 0) == nil,
+              frun(24, 0)?.text ?? "")
+        check("\(name): nor the mode line with its icon", frun(7, 0) == nil, frun(7, 0)?.text ?? "")
+        check("\(name): nor the artifact pill", frun(2, 1) == nil && frun(5, 1) == nil)
+        check("\(name): nor the pill in the accent", frun(6, 2) == nil, frun(6, 2)?.text ?? "")
+        check("\(name): nor the grey version line", frun(3, 3) == nil)
+    }
+
+    // Grey only reads as turned down when it is quieter than body text.
+    let (loud, feedLoud) = buffer(cols: 40, rows: 2, theme: .kuddoDark)
+    feedLoud("see \u{1b}[38;2;255;255;255mIMPORTANT\(plain) and \u{1b}[38;2;102;102;102mhint\(plain)\r\n")
+    let lfg = PackedColor(Theme.kuddoDark.foreground)
+    check("white on a dark theme is emphasis, and a run",
+          ColorRunDetector.run(at: (6, 0), snapshot: loud.snapshot(), defaultForeground: lfg)?.text == "IMPORTANT")
+    check("grey on it is not",
+          ColorRunDetector.run(at: (19, 0), snapshot: loud.snapshot(), defaultForeground: lfg) == nil)
+
+    // An icon is a non-ASCII symbol; inline code opening with ASCII
+    // punctuation is still code.
+    let (code, feedCode) = buffer(cols: 40, rows: 4)
+    feedCode("a \(accent)<div>\(plain) b\r\n")
+    feedCode("a \(accent)~/src\(plain) b\r\n")
+    feedCode("a \(accent)→ next\(plain) b\r\n")
+    check("inline code opening with < is a run", run(code.snapshot(), 3, 0)?.text == "<div>")
+    check("inline code opening with ~ is a run", run(code.snapshot(), 3, 1)?.text == "~/src")
+    check("a run opening with an arrow is a label", run(code.snapshot(), 5, 2) == nil)
+
+    // A row of a coloured paragraph can open with a command's name. The
+    // paragraph wins when it covers the block; a command coloured token by
+    // token stays a command.
+    let (mixed, feedMixed) = buffer(cols: 40, rows: 4)
+    feedMixed("\u{1b}[32mgit\(plain) log --oneline -n 5\r\n")
+    let ms = mixed.snapshot()
+    if let r = run(ms, 1, 0) {
+        check("a green command name doesn't cover its command",
+              !ColorRunDetector.run(r, covers: 0...0, in: ms))
+    } else {
+        check("a green command name is a run", false)
+    }
+    if let r = run(ds, 12, 2) {
+        check("a draft covers each of its rows", ColorRunDetector.run(r, covers: 1...3, in: ds))
+    }
+
+    // Headings that open with something on $PATH.
+    let onPath: (String) -> Bool = { ["who", "time", "find", "open"].contains($0) }
+    check("\"who is this for\" is prose",
+          !CommandBlockDetector.looksLikeCommand("who is this for / when to use it (262 of 60–300)",
+                                                 isExecutable: onPath))
+    check("\"time to ship\" is prose",
+          !CommandBlockDetector.looksLikeCommand("time to ship", isExecutable: onPath))
+    check("`who am i` is still a command",
+          CommandBlockDetector.looksLikeCommand("who am i", isExecutable: onPath))
+    check("`open .` is still a command",
+          CommandBlockDetector.looksLikeCommand("open .", isExecutable: onPath))
+}
+
+print("\n\(failures == 0 ? "all checks passed" : "\(failures) check(s) FAILED")")
+exit(failures == 0 ? 0 : 1)
