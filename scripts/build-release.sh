@@ -20,7 +20,7 @@ set -euo pipefail
 DEVELOPER_ID_APPLICATION="${DEVELOPER_ID_APPLICATION:-Developer ID Application: Dox2A Labs LLC (7JD669BMB4)}"
 NOTARY_PROFILE="${NOTARY_PROFILE:-mterm-notary}"
 BUNDLE_ID="${BUNDLE_ID:-com.d0x2a.mTerm}"
-VERSION="${VERSION:-1.0.0}"
+VERSION="${VERSION:-1.0.1}"
 
 # CFBundleVersion is what macOS ranks copies of an app by, and Kuddo shares
 # mTerm's bundle id, so it has to stay above every mTerm (the last was 1.6.0).
