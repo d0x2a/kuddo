@@ -5,8 +5,10 @@
 # Optional env vars
 # -----------------
 #   BUNDLE_ID    Defaults to com.d0x2a.mTerm.
-#   VERSION      Defaults to current version. Goes into both
-#                CFBundleShortVersionString and CFBundleVersion.
+#   VERSION      Defaults to current version. Goes into
+#                CFBundleShortVersionString.
+#   BUILD        Defaults to one derived from VERSION. Goes into
+#                CFBundleVersion.
 #
 # The bundle id and the notary profile still say mTerm, Kuddo's old name.
 # Changing the id would make macOS treat Kuddo as a new app — the
@@ -19,6 +21,19 @@ DEVELOPER_ID_APPLICATION="${DEVELOPER_ID_APPLICATION:-Developer ID Application: 
 NOTARY_PROFILE="${NOTARY_PROFILE:-mterm-notary}"
 BUNDLE_ID="${BUNDLE_ID:-com.d0x2a.mTerm}"
 VERSION="${VERSION:-1.0.0}"
+
+# CFBundleVersion is what macOS ranks copies of an app by, and Kuddo shares
+# mTerm's bundle id, so it has to stay above every mTerm (the last was 1.6.0).
+# Otherwise a leftover mTerm.app wins: notifications take its icon, and
+# clicking one opens it. One integer per version — major·10000 + minor·100 +
+# patch — keeps it rising with Kuddo's own versions: 1.0.1 is 10001.
+IFS=. read -r V_MAJOR V_MINOR V_PATCH <<< "$VERSION"
+V_PATCH="${V_PATCH:-0}"
+(( V_MINOR < 100 && V_PATCH < 100 )) || {
+    echo "✗ $VERSION doesn't fit the build-number scheme" >&2
+    exit 1
+}
+BUILD="${BUILD:-$(( V_MAJOR * 10000 + V_MINOR * 100 + V_PATCH ))}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD="$ROOT/build"
@@ -51,9 +66,10 @@ ARCHS="$(lipo -archs "$APP/Contents/MacOS/Kuddo")"
 }
 echo "  binary: $ARCHS"
 
-echo "▶ writing Info.plist (bundle=$BUNDLE_ID, version=$VERSION)"
+echo "▶ writing Info.plist (bundle=$BUNDLE_ID, version=$VERSION, build=$BUILD)"
 sed -e "s|__BUNDLE_ID__|$BUNDLE_ID|g" \
     -e "s|__VERSION__|$VERSION|g" \
+    -e "s|__BUILD__|$BUILD|g" \
     "$ROOT/Resources/Info.plist" > "$APP/Contents/Info.plist"
 
 echo "▶ baking AppIcon.icns"
