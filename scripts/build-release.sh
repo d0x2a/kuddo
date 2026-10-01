@@ -7,7 +7,7 @@
 #   BUNDLE_ID    Defaults to com.d0x2a.mTerm.
 #   VERSION      Defaults to current version. Goes into
 #                CFBundleShortVersionString.
-#   BUILD        Defaults to one derived from VERSION. Goes into
+#   BUILD_NUMBER Defaults to one derived from VERSION. Goes into
 #                CFBundleVersion.
 #
 # The bundle id and the notary profile still say mTerm, Kuddo's old name.
@@ -33,7 +33,7 @@ V_PATCH="${V_PATCH:-0}"
     echo "✗ $VERSION doesn't fit the build-number scheme" >&2
     exit 1
 }
-BUILD="${BUILD:-$(( V_MAJOR * 10000 + V_MINOR * 100 + V_PATCH ))}"
+BUILD_NUMBER="${BUILD_NUMBER:-$(( V_MAJOR * 10000 + V_MINOR * 100 + V_PATCH ))}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD="$ROOT/build"
@@ -66,10 +66,10 @@ ARCHS="$(lipo -archs "$APP/Contents/MacOS/Kuddo")"
 }
 echo "  binary: $ARCHS"
 
-echo "▶ writing Info.plist (bundle=$BUNDLE_ID, version=$VERSION, build=$BUILD)"
+echo "▶ writing Info.plist (bundle=$BUNDLE_ID, version=$VERSION, build=$BUILD_NUMBER)"
 sed -e "s|__BUNDLE_ID__|$BUNDLE_ID|g" \
     -e "s|__VERSION__|$VERSION|g" \
-    -e "s|__BUILD__|$BUILD|g" \
+    -e "s|__BUILD_NUMBER__|$BUILD_NUMBER|g" \
     "$ROOT/Resources/Info.plist" > "$APP/Contents/Info.plist"
 
 echo "▶ baking AppIcon.icns"
