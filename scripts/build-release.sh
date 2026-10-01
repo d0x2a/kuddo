@@ -4,29 +4,27 @@
 #
 # Optional env vars
 # -----------------
-#   BUNDLE_ID    Defaults to com.d0x2a.mTerm.
+#   BUNDLE_ID    Defaults to com.d0x2a.kuddo.
 #   VERSION      Defaults to current version. Goes into
 #                CFBundleShortVersionString.
 #   BUILD_NUMBER Defaults to one derived from VERSION. Goes into
 #                CFBundleVersion.
 #
-# The bundle id and the notary profile still say mTerm, Kuddo's old name.
-# Changing the id would make macOS treat Kuddo as a new app — the
-# notification permission and Files & Folders grants would both reset — and
-# the profile names a keychain item that already exists.
+# Kuddo 1.0.0 kept mTerm's bundle id, com.d0x2a.mTerm, so the notification
+# permission and Files & Folders grants carried over. Sharing an id let macOS
+# mix the two apps up, so from 1.0.1 Kuddo has its own and asks for those
+# permissions again.
 
 set -euo pipefail
 
 DEVELOPER_ID_APPLICATION="${DEVELOPER_ID_APPLICATION:-Developer ID Application: Dox2A Labs LLC (7JD669BMB4)}"
-NOTARY_PROFILE="${NOTARY_PROFILE:-mterm-notary}"
-BUNDLE_ID="${BUNDLE_ID:-com.d0x2a.mTerm}"
+NOTARY_PROFILE="${NOTARY_PROFILE:-kuddo-notary}"
+BUNDLE_ID="${BUNDLE_ID:-com.d0x2a.kuddo}"
 VERSION="${VERSION:-1.0.1}"
 
-# CFBundleVersion is what macOS ranks copies of an app by, and Kuddo shares
-# mTerm's bundle id, so it has to stay above every mTerm (the last was 1.6.0).
-# Otherwise a leftover mTerm.app wins: notifications take its icon, and
-# clicking one opens it. One integer per version — major·10000 + minor·100 +
-# patch — keeps it rising with Kuddo's own versions: 1.0.1 is 10001.
+# CFBundleVersion is what macOS ranks copies of an app by, so it has to rise
+# with every release. One integer per version — major·10000 + minor·100 +
+# patch — does that: 1.0.1 is 10001.
 IFS=. read -r V_MAJOR V_MINOR V_PATCH <<< "$VERSION"
 V_PATCH="${V_PATCH:-0}"
 (( V_MINOR < 100 && V_PATCH < 100 )) || {
