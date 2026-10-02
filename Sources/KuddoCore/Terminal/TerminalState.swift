@@ -1389,19 +1389,17 @@ package final class TerminalState: ParserSink {
     /// active grid. Returns matches in reading order (oldest first), each tagged
     /// with an absolute line number so it stays addressable as the grid scrolls.
     /// The whole buffer as plain text: scrollback followed by the active grid,
-    /// one line per row with trailing blanks trimmed. Trailing empty lines (the
-    /// unused grid below the cursor) are dropped. Used by "Copy All".
+    /// read exactly as Select All then Copy would read it, so wrapped lines
+    /// come out whole. Trailing empty lines (the unused grid below the cursor)
+    /// are dropped. Used by "Copy All".
     package func bufferText() -> String {
-        var lines: [String] = []
-        lines.reserveCapacity(scrollbackCount + rows)
-        for i in 0..<scrollbackCount {
-            lines.append(Self.rowText(scrollbackRow(i)))
-        }
-        for r in 0..<rows {
-            lines.append(Self.rowText(gridRow(r)))
-        }
-        while let last = lines.last, last.isEmpty { lines.removeLast() }
-        return lines.joined(separator: "\n")
+        guard let bounds = contentBounds() else { return "" }
+        var text = self.text(from: bounds.firstLine, startCol: 0,
+                             to: bounds.lastLine, endCol: bounds.lastCol)
+        // contentBounds counts a coloured blank as content, which a selection
+        // wants and plain text has no use for.
+        while let last = text.last, last == " " || last == "\n" { text.removeLast() }
+        return text
     }
 
     /// The row at an absolute line number — the same coordinate space as
@@ -1437,12 +1435,34 @@ package final class TerminalState: ParserSink {
         return nil
     }
 
+    /// Whether the row at an absolute line ran out of width and carries on in
+    /// the row below — `row(atAbsolute:)`'s counterpart for the wrapped flags.
+    private func wrapped(atAbsolute line: Int) -> Bool {
+        let topOfHistory = scrolledRows - scrollbackCount
+        if line < topOfHistory { return false }
+        if line < scrolledRows { return scrollbackWrapped[scrollbackSlot(line - topOfHistory)] }
+        let r = line - scrolledRows
+        guard r >= 0, r < rows else { return false }
+        return rowWrapped[ringRow(r)]
+    }
+
+    /// Whether a wrapped row ends in the blank a double-width glyph leaves at
+    /// the edge when it moves to the next row whole rather than straddle it.
+    /// Nothing tells that apart from a real space before a wide glyph that
+    /// wrapped, but the padding is by far the commoner of the two.
+    private static func endsInWidePad(_ row: [Cell], before next: [Cell]) -> Bool {
+        guard let last = row.last, let head = next.first else { return false }
+        return last.isBlank && head.width == 2
+    }
+
     /// Text for an absolute-line range, spanning scrollback and the active
     /// grid. Lines that have aged out of scrollback are skipped, so a selection
-    /// older than the buffer yields whatever survives of it.
+    /// older than the buffer yields whatever survives of it. A row that wrapped
+    /// joins the next without a newline: the break was the terminal's, not
+    /// the program's, so a long command or URL pastes as the one line it was.
     package func text(from startLine: Int, startCol: Int, to endLine: Int, endCol: Int) -> String {
         guard endLine >= startLine else { return "" }
-        var lines: [String] = []
+        var out = ""
         for line in startLine...endLine {
             guard let row = row(atAbsolute: line) else { continue }
             // Resize doesn't reflow history, so a scrollback row keeps whatever
@@ -1456,24 +1476,24 @@ package final class TerminalState: ParserSink {
                     text.unicodeScalars.append(row[c].scalar)
                 }
             }
-            // Strip trailing spaces from each row except the last (so single-line
-            // selections preserve trailing spaces if you actually selected them).
-            if line != endLine {
+            if line != endLine && wrapped(atAbsolute: line) {
+                // A wrapped row is full to the edge, so a space there is text —
+                // unless it is the pad a double-width glyph left behind.
+                if lastCol == row.count - 1, text.last == " ",
+                   let next = self.row(atAbsolute: line + 1),
+                   Self.endsInWidePad(row, before: next) {
+                    text.removeLast()
+                }
+            } else if line != endLine {
+                // Strip trailing spaces from each row except the last (so
+                // single-line selections keep trailing spaces you actually
+                // selected).
                 while text.last == " " { text.removeLast() }
+                text.append("\n")
             }
-            lines.append(text)
+            out += text
         }
-        return lines.joined(separator: "\n")
-    }
-
-    private static func rowText(_ row: [Cell]) -> String {
-        var line = ""
-        line.reserveCapacity(row.count)
-        for cell in row where !cell.isContinuation {
-            line.unicodeScalars.append(cell.scalar)
-        }
-        while line.last == " " { line.removeLast() }
-        return line
+        return out
     }
 
     package func search(query: String, regex useRegex: Bool, caseSensitive: Bool) -> [SearchMatch] {
@@ -2322,6 +2342,10 @@ package final class TerminalState: ParserSink {
                 }
                 if row.wrapped && j + 1 < source.count {
                     joined.append(contentsOf: row.cells)
+                    // That pad held the glyph's place at the old width only.
+                    if Self.endsInWidePad(row.cells, before: source[j + 1].cells) {
+                        joined.removeLast()
+                    }
                     j += 1
                 } else {
                     joined.append(contentsOf: row.cells[0 ..< Self.trimmedCount(row.cells, blank: blank)])
@@ -2369,8 +2393,14 @@ package final class TerminalState: ParserSink {
             } while pos < line.used
 
             for (k, start) in starts.enumerated() {
-                rebuilt.append((cells: Array(line.cells[start ..< start + lengths[k]]),
-                                wrapped: k < starts.count - 1))
+                let wraps = k < starts.count - 1
+                var cells = Array(line.cells[start ..< start + lengths[k]])
+                // Only a pushed-down glyph leaves a wrapping row short. Pad it
+                // where the glyph would have gone, as live wrapping does: a
+                // short row ending in a real space would pass for padding, and
+                // copy would drop that space.
+                if wraps && lengths[k] < newCols { cells.append(blank) }
+                rebuilt.append((cells: cells, wrapped: wraps))
             }
 
             guard li == cursorLogical else { continue }

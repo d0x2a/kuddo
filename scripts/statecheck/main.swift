@@ -555,6 +555,76 @@ do {
     s.resize(cols: 8, rows: 4)
     check("and re-splits on the way back", row(s.snapshot(), 0) == "hello wo",
           "got \"\(row(s.snapshot(), 0))\"")
+
+    // 中 moved down whole at 5 columns, leaving the edge blank. That blank
+    // only held its place at that width.
+    let (dw, dwfeed) = buffer(cols: 5, rows: 3)
+    dwfeed("abcd中ef")
+    dw.resize(cols: 20, rows: 3)
+    check("widening drops the blank a wide glyph left at the old edge",
+          row(dw.snapshot(), 0) == "abcd中ef", "got \(row(dw.snapshot(), 0).debugDescription)")
+
+    // Narrowing pushes 中 down from behind a real space. The row it leaves
+    // goes to history, where a short row ending in that space would pass for
+    // padding — so it has to be padded the way live wrapping pads it.
+    let (sp, spfeed) = buffer(cols: 20, rows: 2)
+    spfeed("abc 中def\r\nz")
+    sp.resize(cols: 5, rows: 2)
+    check("narrowing keeps a real space before a wide glyph it pushes down",
+          sp.bufferText() == "abc 中def\nz", sp.bufferText().debugDescription)
+    sp.resize(cols: 20, rows: 2)
+    check("and the line comes back whole",
+          sp.bufferText() == "abc 中def\nz", sp.bufferText().debugDescription)
+}
+
+section("copy")
+do {
+    /// What Select All then Copy puts on the clipboard.
+    func selectAll(_ s: TerminalState) -> String {
+        guard let b = s.contentBounds() else { return "" }
+        return s.text(from: b.firstLine, startCol: 0, to: b.lastLine, endCol: b.lastCol)
+    }
+
+    let (w, wfeed) = buffer(cols: 5, rows: 4)
+    wfeed("abcdefgh\r\nnext")
+    check("a wrapped line copies as one line", selectAll(w) == "abcdefgh\nnext",
+          selectAll(w).debugDescription)
+    check("and Copy All reads it the same way", w.bufferText() == "abcdefgh\nnext",
+          w.bufferText().debugDescription)
+    let top = w.scrolledRows
+    let part = w.text(from: top, startCol: 2, to: top + 1, endCol: 1)
+    check("a selection across the wrap joins too", part == "cdefg", part.debugDescription)
+
+    // Breaking right after a space: the space is the text's, not padding.
+    let (sp, spfeed) = buffer(cols: 6, rows: 3)
+    spfeed("hello world")
+    check("a space at the wrap edge survives", selectAll(sp) == "hello world",
+          selectAll(sp).debugDescription)
+
+    let (n, nfeed) = buffer(cols: 10, rows: 3)
+    nfeed("ab   \r\ncd")
+    check("a newline the program sent stays one, trailing blanks trimmed",
+          selectAll(n) == "ab\ncd", selectAll(n).debugDescription)
+
+    // 中 won't straddle the edge, so it moves down whole and leaves the last
+    // column of the row above blank.
+    let (dw, dwfeed) = buffer(cols: 5, rows: 3)
+    dwfeed("abcd中ef")
+    check("the blank a wide glyph leaves at the edge is not copied",
+          selectAll(dw) == "abcd中ef", selectAll(dw).debugDescription)
+
+    let (h, hfeed) = buffer(cols: 5, rows: 2, scrollback: 100)
+    hfeed("abcdefgh\r\n1\r\n2\r\n3")
+    check("a line that wrapped is still whole once it's in history",
+          h.bufferText() == "abcdefgh\n1\n2\n3", h.bufferText().debugDescription)
+
+    // zsh's PROMPT_SP after output that didn't end in a newline: an inverse
+    // `%`, spaces to the edge and past it, then the prompt from column 0 of
+    // the row below. That crossing is padding, so it isn't a wrap.
+    let (z, zfeed) = buffer(cols: 10, rows: 3)
+    zfeed("partial\u{1b}[7m%\u{1b}[27m" + String(repeating: " ", count: 9) + "\r \r$ ls")
+    check("zsh's PROMPT_SP padding doesn't join the prompt to the line above",
+          selectAll(z) == "partial%\n$ ls", selectAll(z).debugDescription)
 }
 
 section("triggers")
