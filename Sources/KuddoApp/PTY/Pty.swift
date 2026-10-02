@@ -39,7 +39,7 @@ final class Pty {
             src.cancel()
         }
         close(masterFd)
-        if reaped == nil { kill(pid, SIGHUP) }
+        Reaper.hangUp(pid)
     }
 
     /// Starts `spec` on a fresh PTY. Shell integration is applied here, per
@@ -86,6 +86,7 @@ final class Pty {
             }
         }
         if master < 0 { return nil }
+        Reaper.watch(pid)
 
         let flags = fcntl(master, F_GETFL, 0)
         _ = fcntl(master, F_SETFL, flags | O_NONBLOCK)
@@ -103,24 +104,6 @@ final class Pty {
             body(buf.baseAddress!)
         }
     }
-
-    /// The child's exit status once it has gone, reaped here because nothing
-    /// else waits on it. nil while it is still running. Main-thread only.
-    func exitStatus() -> Int32? {
-        if let reaped { return reaped }
-        var status: Int32 = 0
-        let r = waitpid(pid, &status, WNOHANG)
-        guard r == pid else { return nil }
-        let code: Int32
-        if (status & 0x7f) == 0 {
-            code = (status >> 8) & 0xff              // WEXITSTATUS
-        } else {
-            code = 128 + (status & 0x7f)             // killed by a signal
-        }
-        reaped = code
-        return code
-    }
-    private var reaped: Int32?
 
     func write(_ bytes: [UInt8]) {
         guard !bytes.isEmpty else { return }
@@ -225,5 +208,57 @@ final class Pty {
         }
         cachedForeground = (pgid, fg, name, now)
         return (fg, name)
+    }
+}
+
+/// Waits on the shells Kuddo starts. A child that exits stays in the process
+/// table as a zombie until its parent waits on it, and nothing else here does:
+/// every shell that ended — `exit` at the prompt, or the hangup from closing
+/// its tab — used to linger until Kuddo quit.
+///
+/// One SIGCHLD source for the app. Signals coalesce, so each one checks every
+/// child still running rather than taking it to mean that one exited.
+private enum Reaper {
+    private static let queue = DispatchQueue(label: "kuddo.pty.reap", qos: .utility)
+    /// Guards `running`, and the wait that takes a pid out of it, so a hangup
+    /// can't land in between.
+    private static let lock = NSLock()
+    private static var running = Set<pid_t>()
+    private static let source: DispatchSourceSignal = {
+        let src = DispatchSource.makeSignalSource(signal: SIGCHLD, queue: queue)
+        src.setEventHandler { reapExited() }
+        src.resume()
+        return src
+    }()
+
+    /// Starts watching `pid`. It may have exited already — an argv that fails
+    /// to exec is gone in microseconds, before the source could see it — so
+    /// look once now as well.
+    static func watch(_ pid: pid_t) {
+        _ = source
+        lock.lock(); defer { lock.unlock() }
+        running.insert(pid)
+        reapIfExited(pid)
+    }
+
+    /// SIGHUP for a closing tab, unless the child has been reaped: its pid is
+    /// free then, and may belong to some other process by now.
+    static func hangUp(_ pid: pid_t) {
+        lock.lock(); defer { lock.unlock() }
+        if running.contains(pid) { kill(pid, SIGHUP) }
+    }
+
+    private static func reapExited() {
+        lock.lock(); defer { lock.unlock() }
+        for pid in running { reapIfExited(pid) }
+    }
+
+    /// Caller holds `lock`.
+    private static func reapIfExited(_ pid: pid_t) {
+        var status: Int32 = 0
+        var r: pid_t
+        repeat { r = waitpid(pid, &status, WNOHANG) } while r == -1 && errno == EINTR
+        // -1 here is ECHILD: not ours to wait on any more, so stop asking.
+        if r == pid || r == -1 { running.remove(pid) }
     }
 }
