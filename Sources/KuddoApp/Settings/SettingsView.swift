@@ -30,19 +30,11 @@ struct SettingsView: View {
 
     var body: some View {
         NavigationSplitView {
-            if query.isEmpty {
-                List(SettingsCategory.allCases, selection: $selection) { category in
-                    Label(category.title, systemImage: category.systemImage)
-                        .tag(category)
-                }
+            sidebar
                 .navigationSplitViewColumnWidth(min: 160, ideal: 175, max: 220)
                 // Named so ⇧Tab off the first control can hand the arrow keys
                 // back to the category list.
                 .focused($focus, equals: .sidebar)
-            } else {
-                resultsList
-                    .navigationSplitViewColumnWidth(min: 160, ideal: 175, max: 220)
-            }
         } detail: {
             detail(for: selection ?? .appearance)
                 .navigationTitle((selection ?? .appearance).title)
@@ -92,36 +84,51 @@ struct SettingsView: View {
         .environment(\.settingsKeyboardActive, keyboardActive)
     }
 
-    // MARK: search results
+    // MARK: sidebar
 
-    @ViewBuilder
-    private var resultsList: some View {
-        if results.isEmpty {
-            VStack(spacing: 6) {
-                Text("No settings found")
-                    .foregroundStyle(.secondary)
-                Text("Try “font”, “scrollback”, or “bell”.")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .padding()
-        } else {
-            List(results) { entry in
-                Button { open(entry) } label: {
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(entry.label)
-                            .lineLimit(2)
-                        // Which pane it lives in, so a result is somewhere you
-                        // can go back to without searching again.
-                        Label(entry.category.title, systemImage: entry.category.systemImage)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .contentShape(Rectangle())
+    /// One `List` whether it shows the categories or search results. The
+    /// sidebar search field is a row of this list, not a fixed header, so
+    /// replacing the list replaces the field: swapping in a results list on
+    /// the first keystroke rebuilds it without focus, so only that one letter
+    /// lands, and swapping in a plain "no results" view drops it altogether,
+    /// stranding a query nothing can clear.
+    private var sidebar: some View {
+        List(selection: $selection) {
+            if query.isEmpty {
+                ForEach(SettingsCategory.allCases) { category in
+                    Label(category.title, systemImage: category.systemImage)
+                        .tag(category)
                 }
-                .buttonStyle(.plain)
+            } else {
+                ForEach(results) { entry in
+                    Button { open(entry) } label: {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(entry.label)
+                                .lineLimit(2)
+                            // Which pane it lives in, so a result is somewhere
+                            // you can go back to without searching again.
+                            Label(entry.category.title, systemImage: entry.category.systemImage)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+        .overlay {
+            if !query.isEmpty, results.isEmpty {
+                VStack(spacing: 6) {
+                    Text("No settings found")
+                        .foregroundStyle(.secondary)
+                    Text("Try “font”, “scrollback”, or “bell”.")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                }
+                .multilineTextAlignment(.center)
+                .padding()
             }
         }
     }
