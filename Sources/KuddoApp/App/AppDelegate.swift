@@ -129,7 +129,9 @@ package final class AppDelegate: NSObject, NSApplicationDelegate {
     package func applicationWillTerminate(_ notification: Notification) {
         let controller = activeController()
         let tabs = controller?.tabs.map { tab -> SavedTab in
-            SavedTab(cwd: tab.terminalView.currentDirectory,
+            // A tab restored in the background and never looked at has no
+            // shell to ask, so it keeps the directory it was restored to.
+            SavedTab(cwd: tab.terminalView.currentDirectory ?? tab.terminalView.initialCwd,
                      profileId: tab.profileId?.uuidString)
         } ?? []
         let window = controller?.window
