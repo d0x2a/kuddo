@@ -16,6 +16,13 @@ final class SettingsWindowController: NSWindowController {
     /// alone. Switching panes does, so that resizes.
     private var lastFittedPaneHeight: CGFloat = 0
 
+    private static let frameAutosaveName = "Kuddo.SettingsWindow"
+
+    /// True until the first fit when there was no saved frame to restore: the
+    /// window doesn't know its height until the pane has laid out, so placing
+    /// it waits until then.
+    private var placeOnFirstFit = false
+
     convenience init() {
         let hosting = SettingsHostingController(rootView: SettingsView())
         let window = SettingsWindow(contentViewController: hosting)
@@ -28,10 +35,15 @@ final class SettingsWindowController: NSWindowController {
         // Controller, so the fit below enforces `minContentHeight` directly.)
         window.contentMinSize = NSSize(width: 600, height: Self.minContentHeight)
         window.isReleasedWhenClosed = false        // reuse on next ⌘,
-        window.center()
-        window.setFrameAutosaveName("Kuddo.SettingsWindow")
+        window.center()                            // near enough until the first fit
+        let restored = window.setFrameUsingName(Self.frameAutosaveName)
         self.init(window: window)
         window.windowController = self
+        // On the controller, not the window: taking the window over hands it
+        // the controller's own autosave name, empty unless set, so a name set
+        // on the window beforehand never saved a frame.
+        windowFrameAutosaveName = Self.frameAutosaveName
+        placeOnFirstFit = !restored
         hosting.onLayout = { [weak self] in self?.fitWindowToPaneIfNeeded() }
         // Catches a font installed while Settings sat open in the background:
         // going off to install one makes another app key, and coming back
@@ -90,21 +102,34 @@ final class SettingsWindowController: NSWindowController {
 
         var targetFrame = window.frameRect(forContentRect: NSRect(
             x: 0, y: 0, width: contentView.frame.width, height: targetContentHeight))
-        if let screen = window.screen ?? NSScreen.main {
+        let visible = (window.screen ?? NSScreen.main)?.visibleFrame
+        if let visible {
             let titleBar = targetFrame.height - targetContentHeight
-            targetContentHeight = min(targetContentHeight, screen.visibleFrame.height - titleBar)
+            targetContentHeight = min(targetContentHeight, visible.height - titleBar)
             targetFrame = window.frameRect(forContentRect: NSRect(
                 x: 0, y: 0, width: contentView.frame.width, height: targetContentHeight))
         }
 
         var frame = window.frame
-        guard abs(frame.height - targetFrame.height) > 1 else { return }
-        // Grow downward: the title bar stays put instead of the window
-        // creeping up the screen every time you switch panes...
-        frame.origin.y += frame.height - targetFrame.height
-        frame.size.height = targetFrame.height
-        // ...unless that would push the bottom off the display, in which case
-        // AppKit slides the whole window back into the visible area for us.
+        if placeOnFirstFit, let visible {
+            // Nowhere saved to go back to, so it goes where `center()` would
+            // put a window of its final size.
+            placeOnFirstFit = false
+            frame.size.height = targetFrame.height
+            frame.origin = Self.restingOrigin(for: frame.size, in: visible)
+        } else {
+            guard abs(frame.height - targetFrame.height) > 1 else { return }
+            // Grow downward: the title bar stays put instead of the window
+            // creeping up the screen every time you switch panes...
+            frame.origin.y += frame.height - targetFrame.height
+            frame.size.height = targetFrame.height
+            // ...unless the bottom would run past the screen's, in which case
+            // it moves to where opening puts it rather than as little as
+            // possible, which left it sitting flat on the Dock.
+            if let visible, frame.minY < visible.minY {
+                frame.origin.y = Self.restingOrigin(for: frame.size, in: visible).y
+            }
+        }
         frame = window.constrainFrameRect(frame, to: window.screen)
 
         // Out of the layout pass that triggered us — resizing re-enters layout.
@@ -112,6 +137,14 @@ final class SettingsWindowController: NSWindowController {
             window.setFrame(frame, display: true,
                             animate: !isFirstFit && window.isVisible)
         }
+    }
+
+    /// Centred across, with the spare height split a third above and two
+    /// thirds below: slightly above centre, as `NSWindow.center()` places a
+    /// window.
+    private static func restingOrigin(for size: NSSize, in visible: NSRect) -> NSPoint {
+        NSPoint(x: visible.midX - size.width / 2,
+                y: visible.minY + max(0, visible.height - size.height) * 2 / 3)
     }
 
     /// The detail pane's scroll view — the widest one in the window, since the
