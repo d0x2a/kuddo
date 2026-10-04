@@ -94,27 +94,33 @@ struct SettingsView: View {
     /// stranding a query nothing can clear.
     private var sidebar: some View {
         List(selection: $selection) {
-            if query.isEmpty {
-                ForEach(SettingsCategory.allCases) { category in
-                    Label(category.title, systemImage: category.systemImage)
-                        .tag(category)
-                }
-            } else {
-                ForEach(results) { entry in
-                    Button { open(entry) } label: {
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(entry.label)
-                                .lineLimit(2)
-                            // Which pane it lives in, so a result is somewhere
-                            // you can go back to without searching again.
-                            Label(entry.category.title, systemImage: entry.category.systemImage)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .contentShape(Rectangle())
+            // A section of its own so the list sets the rows apart from the
+            // search field, which is a row of this list too and otherwise sits
+            // flush against the first of them.
+            Section {
+                if query.isEmpty {
+                    ForEach(SettingsCategory.allCases) { category in
+                        Label(category.title, systemImage: category.systemImage)
+                            .tag(category)
                     }
-                    .buttonStyle(.plain)
+                } else {
+                    ForEach(results) { entry in
+                        Button { open(entry) } label: {
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(entry.label)
+                                    .lineLimit(2)
+                                // Which pane it lives in, so a result is
+                                // somewhere you can go back to without
+                                // searching again.
+                                Label(entry.category.title, systemImage: entry.category.systemImage)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
                 }
             }
         }
