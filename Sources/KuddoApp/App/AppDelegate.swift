@@ -8,6 +8,11 @@ package final class AppDelegate: NSObject, NSApplicationDelegate {
     /// deallocate as soon as `applicationDidFinishLaunching` returns.
     private var initialController: MainWindowController?
     private var tabCycleMonitor: Any?
+    /// Folders handed over before the window existed. When `kuddo <folder>`
+    /// is what launches the app, AppKit delivers the folder ahead of
+    /// `applicationDidFinishLaunching`; it waits here so the window can open
+    /// on it instead of on a home-directory tab nobody asked for.
+    private var pendingFolders: [String] = []
 
     package func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.applicationIconImage = AppIcon.make()
@@ -53,9 +58,12 @@ package final class AppDelegate: NSObject, NSApplicationDelegate {
         installTabCycleShortcut()
 
         let saved = Persistence.load()
-        // An empty window when there are tabs to restore — see `restoreTabs`.
+        // An empty window when there are tabs to restore or folders to open —
+        // see `restoreTabs`.
         let savedTabs = saved?.tabs ?? []
-        let controller = MainWindowController(openInitialTab: savedTabs.isEmpty)
+        let folders = pendingFolders
+        pendingFolders = []
+        let controller = MainWindowController(openInitialTab: savedTabs.isEmpty && folders.isEmpty)
         initialController = controller
 
         if let window = controller.window, let rect = saved?.windowFrame {
@@ -67,8 +75,12 @@ package final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // Before the window is shown, so it opens with its tabs already in
-        // place rather than visibly filling up.
-        controller.restoreTabs(savedTabs)
+        // place rather than visibly filling up. Only with something to
+        // restore: given an empty list, `restoreTabs` puts a home tab in the
+        // window, which is wrong when the folders are about to fill it.
+        if !savedTabs.isEmpty { controller.restoreTabs(savedTabs) }
+        // After the restored tabs, so the folder asked for is the tab in front.
+        for folder in folders { controller.newTab(initialCwd: folder) }
 
         controller.showWindow(nil)
 
@@ -81,6 +93,37 @@ package final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// A folder handed to Kuddo — `kuddo <folder>`, which is `open` under the
+    /// hood, or a folder dropped on the Dock icon — opens as a new tab there,
+    /// one per folder, the last one in front.
+    ///
+    /// Always a local shell, even in tmux control mode where ⌘T makes a tmux
+    /// window: the folder is on this Mac, and the tmux server may not be.
+    package func application(_ application: NSApplication, open urls: [URL]) {
+        let folders = urls.compactMap(Self.folderPath)
+        guard !folders.isEmpty else { return }
+        guard let controller = activeController() else {
+            pendingFolders += folders
+            return
+        }
+        for folder in folders { controller.newTab(initialCwd: folder) }
+        controller.showWindow(nil)
+    }
+
+    /// The directory a URL from `open` names, with an alias or symlink
+    /// followed to where it points. nil for anything else: an alias can point
+    /// at a file, and `open -a Kuddo file.txt` sends one whatever the
+    /// Info.plist claims.
+    private static func folderPath(_ url: URL) -> String? {
+        guard url.isFileURL else { return nil }
+        let resolved = (try? URL(resolvingAliasFileAt: url)) ?? url
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: resolved.path, isDirectory: &isDirectory),
+              isDirectory.boolValue
+        else { return nil }
+        return resolved.path
     }
 
     package func applicationWillTerminate(_ notification: Notification) {

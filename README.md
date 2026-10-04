@@ -30,6 +30,8 @@ It is **not** trying to be Warp. No AI features, no cloud accounts, and nothing 
 brew install --cask d0x2a/tap/kuddo
 ```
 
+The cask also installs a `kuddo` command: `kuddo` opens Kuddo, and `kuddo .` opens a tab in the folder you're in.
+
 ### Signed DMG
 
 Grab the latest `.dmg` from [Releases](https://github.com/d0x2a/kuddo/releases), drag Kuddo.app to `/Applications`. The DMG is built for Apple silicon, signed with a Developer ID and notarized by Apple, so Gatekeeper will accept it on first launch.
@@ -47,6 +49,7 @@ swift run -c release Kuddo
 ## What works today
 
 - AppKit-native window with tabbed sidebar (drag to reorder), full-screen, session restore (tabs, their directories and their profiles). The sidebar and split divider tint to the active theme.
+- Folders open as tabs: `kuddo <folder>` from the Homebrew cask, `open -a Kuddo <folder>`, or a folder dropped on the Dock icon. Several folders open a tab each, the last one in front. If that launches Kuddo, the saved session is restored behind the new tabs.
 - ⌘K opens a hub over every tab in every window and every command on the menu bar, ranked in one list. A tab row shows its index, run state, title, directory and foreground process, because three tabs called "Kuddo" is the common case and the title alone never identifies one. Sections lead with their best match, so the first row is always the best answer to ⏎. An empty query lists recent tabs with the previous one selected, making ⌘K ⏎ a flip back; ⌘⌫ closes the highlighted tab without leaving. Actions carry the words you'd arrive with rather than only their menu titles — "cls" finds Clear Screen, "blurry" finds Stroke weight and opens Settings with the focus ring on it.
 - Metal-rendered terminal view with pixel-snapped glyph atlas — crisp text at all sizes, no GPU filtering blur.
 - Bold and italic draw in the font's own faces, not a synthesised slant or smear, and the advance is identical across all four so the columns never drift. Underline, faint and inverse too, including the codes that turn each of them back off.
