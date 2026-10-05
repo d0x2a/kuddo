@@ -272,8 +272,10 @@ final class TabRowView: NSView, NSDraggingSource {
         // must truncate rather than push the badge past the trailing edge.
         label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-        badgeLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .regular)
-        badgeLabel.textColor = .tertiaryLabelColor
+        // Secondary, not tertiary: at a quarter opacity the shortcut was too
+        // faint to read against the tinted sidebar.
+        badgeLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+        badgeLabel.textColor = .secondaryLabelColor
         badgeLabel.alignment = .right
         badgeLabel.translatesAutoresizingMaskIntoConstraints = false
         badgeLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
