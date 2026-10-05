@@ -20,7 +20,7 @@ set -euo pipefail
 DEVELOPER_ID_APPLICATION="${DEVELOPER_ID_APPLICATION:-Developer ID Application: Dox2A Labs LLC (7JD669BMB4)}"
 NOTARY_PROFILE="${NOTARY_PROFILE:-kuddo-notary}"
 BUNDLE_ID="${BUNDLE_ID:-com.d0x2a.kuddo}"
-VERSION="${VERSION:-1.0.4}"
+VERSION="${VERSION:-1.0.5}"
 
 # CFBundleVersion is what macOS ranks copies of an app by, so it has to rise
 # with every release. One integer per version — major·10000 + minor·100 +

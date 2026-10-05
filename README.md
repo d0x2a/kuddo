@@ -10,7 +10,7 @@ A native macOS terminal emulator. Opinionated, GPU-accelerated, focused.
 
 > **Renamed:** Kuddo 1.0.0 is [mTerm](https://github.com/d0x2a/mTerm) 1.6.0 under a new name; mTerm's commit history and releases stay in that repo. Kuddo is built for Apple silicon only, so mTerm 1.6.0 remains the release for Intel Macs. A Homebrew install made under the old name switches with `brew uninstall --cask mterm && brew install --cask d0x2a/tap/kuddo`, and the first launch copies your settings, profiles, triggers, themes and saved tabs from `~/Library/Application Support/mTerm/`, leaving that folder as it was. macOS treats Kuddo as a separate app, so it asks once more before Kuddo shows notifications or reaches into Desktop, Documents and Downloads.
 
-> **Status:** v1.0.4. Every line of the definition of done in [SPEC.md](SPEC.md) has shipped, including tmux `-CC` control mode, profiles, triggers and settings search, and ⌘K now searches every tab and command in one list. Two of the performance targets have been measured rather than asserted: scrollback memory is met with room to spare, throughput is well short of the figure the spec aspired to. Both numbers, and the harness that produced them, are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+> **Status:** v1.0.5. Every line of the definition of done in [SPEC.md](SPEC.md) has shipped, including tmux `-CC` control mode, profiles, triggers and settings search, and ⌘K now searches every tab and command in one list. Two of the performance targets have been measured rather than asserted: scrollback memory is met with room to spare, throughput is well short of the figure the spec aspired to. Both numbers, and the harness that produced them, are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ## Why
 
