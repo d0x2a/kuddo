@@ -1107,8 +1107,11 @@ do {
     // Keyword-only hits: the word someone arrives with is rarely the label.
     check("\"antialiasing\" finds stroke weight",
           SettingsIndex.search("antialiasing").first?.field == .strokeWeight)
-    check("\"history\" finds the scrollback depth",
-          SettingsIndex.search("history").first?.field == .scrollbackLines)
+    // Clearing the screen and the scrollback depth both list "history"; equal
+    // matches keep the index's order, which puts the confirmation first.
+    let history = SettingsIndex.search("history").map(\.field)
+    check("\"history\" finds the clear confirmation, then the scrollback depth",
+          history.prefix(2) == [.confirmClearScreen, .scrollbackLines], "got \(history)")
     check("\"osc\" finds shell integration",
           SettingsIndex.search("osc").first?.field == .shellIntegration)
     check("\"regex\" finds the trigger pattern",
