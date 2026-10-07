@@ -221,20 +221,23 @@ package enum ColorRunDetector {
     }
 
     // MARK: - grid reading
+    //
+    // Shared with QuoteBlockDetector, which rejoins a quote's rows by the
+    // same rules a run's are.
 
-    private struct Key: Equatable {
+    struct Key: Equatable {
         let fg: PackedColor
         let bg: PackedColor
     }
 
     /// One row's piece of the run, inclusive columns, blank edges trimmed.
-    private struct Span {
+    struct Span {
         let row: Int
         let lo: Int
         let hi: Int
     }
 
-    private struct Grid {
+    struct Grid {
         let snapshot: TerminalSnapshot
 
         func cell(_ row: Int, _ col: Int) -> Cell {

@@ -1654,5 +1654,71 @@ do {
           CommandBlockDetector.looksLikeCommand("open .", isExecutable: onPath))
 }
 
+section("quotes")
+do {
+    // A blockquote as Claude Code draws it, laid out like the release notes
+    // the user wanted to ⌘-click: "  ▎ " opening every row, the program's own
+    // word wrap inside, a bar alone between paragraphs, the text in the
+    // default colour.
+    let grey = "\u{1b}[38;2;102;102;102m", plain = "\u{1b}[39m"
+    let cols = 50
+    /// Greedy word wrap, the way the program fills its rows: up to the
+    /// quote's width, which stops one column short of the edge.
+    func wrap(_ line: String) -> [String] {
+        var rows: [String] = [], row = ""
+        for word in line.split(separator: " ") {
+            if row.isEmpty { row = String(word) }
+            else if row.count + 1 + word.count <= cols - 5 { row += " " + word }
+            else { rows.append(row); row = String(word) }
+        }
+        if !row.isEmpty { rows.append(row) }
+        return rows
+    }
+    func quoted(_ paragraphs: [String]) -> String {
+        paragraphs.map { p in
+            p.isEmpty ? "  \(grey)▎\(plain)\r\n"
+                      : wrap(p).map { "  \(grey)▎\(plain) \($0)\r\n" }.joined()
+        }.joined()
+    }
+    func quote(_ s: TerminalSnapshot, _ col: Int, _ row: Int) -> ColorRun? {
+        QuoteBlockDetector.quote(at: (col, row), snapshot: s)
+    }
+    func rowIndex(_ s: TerminalSnapshot, containing text: String) -> Int {
+        (0..<s.rows).first { row(s, $0).contains(text) } ?? -1
+    }
+
+    let intro = "Copying a long key, hash or URL with ⌘-click no longer puts a space in the middle of it."
+    let item = "- Long words copy whole. When a program breaks a line itself, ⌘-click on coloured text put the dropped space back."
+    let outro = "Apple silicon, signed and notarized. Requires macOS 14 or later."
+    let (notes, feedNotes) = buffer(cols: cols, rows: 20)
+    feedNotes("⏺ Draft release notes:\r\n\r\n")
+    feedNotes(quoted([intro, "", "\u{1b}[1mFixed\u{1b}[22m", "", item, "", outro]))
+    feedNotes("\r\n  Once it's published, tell me.\r\n")
+    let ns = notes.snapshot()
+    let whole = "\(intro)\n\nFixed\n\n\(item)\n\n\(outro)"
+    let mid = rowIndex(ns, containing: "a line itself")
+    check("a word inside a quote copies the whole quote", quote(ns, 20, mid)?.text == whole,
+          quote(ns, 20, mid)?.text.debugDescription ?? "nil")
+    check("as one segment per row of text",
+          quote(ns, 20, mid)?.segments.count == wrap(intro).count + 1 + wrap(item).count + wrap(outro).count)
+    let barOnly = rowIndex(ns, containing: "Fixed") - 1
+    check("so does the bar alone on a blank line", quote(ns, 2, barOnly)?.text == whole)
+    check("and the bar beside text", quote(ns, 2, mid)?.text == whole)
+    check("left of the bar is not the quote", quote(ns, 0, mid) == nil)
+    check("nor the line above it", quote(ns, 5, rowIndex(ns, containing: "Draft")) == nil)
+    check("nor the one below", quote(ns, 5, rowIndex(ns, containing: "published")) == nil)
+    check("the quote is marked in its text's colour, not the bar's",
+          quote(ns, 20, mid)?.color == PackedColor(ThemeStore.currentTheme.foreground))
+
+    // A list item that runs to the edge still ends where the next one starts:
+    // the program wrapping a line never opens the next row with a marker.
+    let (list, feedList) = buffer(cols: cols, rows: 4)
+    let full = "- " + String(repeating: "x", count: cols - 7)
+    feedList(quoted([full, "- two"]))
+    check("an item that fills its row doesn't swallow the next",
+          quote(list.snapshot(), 6, 1)?.text == "\(full)\n- two",
+          quote(list.snapshot(), 6, 1)?.text.debugDescription ?? "nil")
+}
+
 print("\n\(failures == 0 ? "all checks passed" : "\(failures) check(s) FAILED")")
 exit(failures == 0 ? 0 : 1)

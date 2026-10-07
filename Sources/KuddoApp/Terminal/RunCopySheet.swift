@@ -1,12 +1,13 @@
 import AppKit
 import KuddoCore
 
-/// The "copy this text?" confirmation for a coloured run.
+/// The "copy this text?" confirmation for a coloured run, or a quote, which
+/// comes as one.
 ///
 /// Asks for the same reason the command sheet does — ⌘-click on text used to
 /// cost nothing, and replacing the clipboard isn't something to find out
-/// about by losing what was on it — but has nothing to adjust: the colour
-/// drew the extent exactly. It counts characters instead, because a passage
+/// about by losing what was on it — but has nothing to adjust: the colour,
+/// or the quote's bar, drew the extent exactly. It counts characters instead, because a passage
 /// set apart like this is usually a draft headed for a field with a limit.
 /// And for the same reason it is sized to the text rather than scrolling:
 /// a draft is read whole before it's pasted.

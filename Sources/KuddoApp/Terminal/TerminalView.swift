@@ -669,12 +669,17 @@ final class TerminalView: NSView, CALayerDelegate {
         return copyTarget(at: coord, snapshot: snapshot)
     }
 
-    /// A cell can read as both a command block and a coloured run. The block
-    /// wins unless the run takes in every character of it: then the "command"
-    /// is a row of a coloured paragraph that happens to open with `bash`, and
-    /// copying one row of the paragraph would be the wrong half.
+    /// Inside a quote, the quote: it is the passage someone set apart, and a
+    /// coloured word or a row that reads as a command inside it is a piece of
+    /// that passage. It comes as a run, marked and confirmed like one.
+    ///
+    /// Elsewhere a cell can read as both a command block and a coloured run.
+    /// The block wins unless the run takes in every character of it: then the
+    /// "command" is a row of a coloured paragraph that happens to open with
+    /// `bash`, and copying one row of the paragraph would be the wrong half.
     private func copyTarget(at coord: (col: Int, row: Int),
                             snapshot: TerminalSnapshot) -> CopyTarget? {
+        if let quote = QuoteBlockDetector.quote(at: coord, snapshot: snapshot) { return .run(quote) }
         let block = commandBlock(at: coord, snapshot: snapshot)
         guard let run = colorRun(at: coord, snapshot: snapshot) else {
             return block.map { .block($0) }
