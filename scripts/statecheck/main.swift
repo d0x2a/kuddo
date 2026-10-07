@@ -1531,6 +1531,30 @@ do {
     check("plain text is not a target", run(ds, 3, 4) == nil)
     check("nor the padding past a draft", run(ds, 30, 3) == nil)
 
+    // A DKIM record in a code block, laid out the way Claude Code laid out
+    // the one the user pasted into Cloudflare with a space in the key: the
+    // key is longer than a row, so the program split it at its own edge, mid-
+    // word, with no wrap flag. Splitting there dropped no space.
+    let key = "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA6HT"
+    let (dkim, feedDkim) = buffer(cols: 40, rows: 3)
+    feedDkim("  \(perWord("v=DKIM1; k=rsa; p=\(key.prefix(19))"))\r\n")
+    feedDkim("  \(perWord(String(key.dropFirst(19).prefix(21))))\r\n")
+    let record = "v=DKIM1; k=rsa; p=\(key.prefix(40))"
+    check("a key the program split across rows copies without a space in it",
+          run(dkim.snapshot(), 30, 0)?.text == record, run(dkim.snapshot(), 30, 0)?.text ?? "nil")
+    check("from either row", run(dkim.snapshot(), 5, 1)?.text == record)
+
+    // The other way a word wrapper handles a word longer than a row: start it
+    // on a row of its own rather than after the short word near the edge.
+    // That break is at a space; the split further down is not.
+    let (pushed, feedPushed) = buffer(cols: 40, rows: 4)
+    feedPushed("  \(perWord("copy the key below and paste it to"))\r\n")
+    feedPushed("  \(perWord(String(key.prefix(37))))\r\n")
+    feedPushed("  \(perWord(String(key.dropFirst(37))))\r\n")
+    check("a long word pushed past a short one keeps the space between them",
+          run(pushed.snapshot(), 6, 0)?.text == "copy the key below and paste it to \(key)",
+          run(pushed.snapshot(), 6, 0)?.text ?? "nil")
+
     // `ls -1`: short rows of the same colour weren't wrapped, so they stay apart.
     let (column, feedColumn) = buffer(cols: 40, rows: 4)
     feedColumn("\(accent)Sources\(plain)\r\n\(accent)docs\(plain)\r\n\(accent)scripts\(plain)\r\n")

@@ -20,7 +20,8 @@ package struct ColorRun: Equatable {
     /// what lights up is exactly what gets copied.
     package let segments: [Segment]
     /// The segments rejoined: a row the terminal wrapped continues without a
-    /// break, a row the program broke itself continues after a space.
+    /// break, a row the program broke itself continues after a space — unless
+    /// it broke inside a word too long for a row, which rejoins whole.
     package let text: String
     /// The run's foreground, for marking it in a colour that is certain to
     /// show against the background — the theme's selection colour isn't:
@@ -57,7 +58,10 @@ package struct ColorRun: Equatable {
 /// the same colour, and that row's first word would not have fitted where
 /// this one ended — which is why the program broke the line there. The fit
 /// test is what keeps `ls -1` from fusing a column of blue directory names
-/// into one: short lines that stop far from the edge weren't wrapped.
+/// into one: short lines that stop far from the edge weren't wrapped. Where
+/// the program broke a line it dropped a space, and the copy puts it back —
+/// except inside a word too long for any row, a key or a hash, which the
+/// program had to split wherever the row ran out.
 ///
 /// Not every colour sets text apart. Claude Code puts its own chrome in colour
 /// too — the version, hints like "(shift+tab to cycle)", the mode line, the
@@ -131,17 +135,10 @@ package enum ColorRunDetector {
             guard spans.count <= maxRows else { return nil }
         }
 
+        let reach = spans.map(\.hi).max() ?? 0
         var text = ""
         for (i, span) in spans.enumerated() {
-            if i > 0 {
-                let above = spans[i - 1]
-                // A soft wrap split the line mid-flow; anything else is a
-                // line the program broke at a space it then dropped.
-                let soft = snapshot.rowWrapped.indices.contains(above.row)
-                    && snapshot.rowWrapped[above.row]
-                    && above.hi == cols - 1 && span.lo == 0
-                if !soft { text.append(" ") }
-            }
+            if i > 0, !grid.continuesWord(from: spans[i - 1], to: span, reach: reach) { text.append(" ") }
             text.append(grid.text(span))
         }
         guard !opensWithIcon(text) else { return nil }
@@ -347,6 +344,33 @@ package enum ColorRunDetector {
             var word = 0
             while start + word < snapshot.cols, !isBlank(next, start + word) { word += 1 }
             return end + 1 + word >= snapshot.cols - ColorRunDetector.wrapSlack
+        }
+
+        /// Does the line carry on from `above` into `next` mid-word, so the
+        /// two join with nothing between them? Always, when the terminal
+        /// wrapped it. When the program broke it, usually not: a word wrapper
+        /// breaks at a space and drops it. The exception is a word too long
+        /// for any row — a key, a hash, a long URL — which it has to split
+        /// wherever the row runs out. A space there would land inside the key.
+        ///
+        /// The split shows as a row filled to the program's edge, whose last
+        /// word joined to the next row's first is wider than a row indented
+        /// like the next one could hold. Where that edge is, `reach` says: the
+        /// furthest any row of the run gets. It matters because the wrapper
+        /// often pushes a long word whole onto the next row rather than start
+        /// it after a short word near the edge — and then the long word's row
+        /// reaches further than the short word's, which gives it away.
+        func continuesWord(from above: Span, to next: Span, reach: Int) -> Bool {
+            let cols = snapshot.cols
+            if snapshot.rowWrapped.indices.contains(above.row), snapshot.rowWrapped[above.row] {
+                return above.hi == cols - 1 && next.lo == 0
+            }
+            guard above.hi == reach, above.hi >= cols - 1 - ColorRunDetector.wrapSlack else { return false }
+            var tail = 0
+            while above.hi - tail >= 0, !isBlank(above.row, above.hi - tail) { tail += 1 }
+            var head = 0
+            while next.lo + head < cols, !isBlank(next.row, next.lo + head) { head += 1 }
+            return tail + head > cols - next.lo
         }
 
         /// Whether a piece has a letter or digit in it. One that doesn't is
