@@ -453,6 +453,76 @@ do {
           "\(a.snapshot().scrollbackLines) lines")
 }
 
+section("keeping a scrolled-back view still")
+do {
+    // Ten lines into three rows: history holds 1–8, and three rows back the
+    // viewport opens on line 6.
+    let (s, feed) = buffer(cols: 20, rows: 3, scrollback: 100)
+    for i in 1...10 { feed("line \(i)\r\n") }
+    let before = s.viewportSnapshot(scrollOffset: 3)
+    check("three rows back opens on line 6", row(before, 0) == "line 6",
+          "got \(row(before, 0).debugDescription)")
+
+    for i in 11...14 { feed("line \(i)\r\n") }
+    let held = s.viewportSnapshot(scrollOffset: 3, heldSince: before.pushedRows)
+    check("held, output doesn't move the text", row(held, 0) == "line 6",
+          "got \(row(held, 0).debugDescription)")
+    check("and the snapshot says how far back that is", held.scrollOffset == 7,
+          "offset \(held.scrollOffset)")
+    let loose = s.viewportSnapshot(scrollOffset: 3)
+    check("not held, the text rides up with the output", row(loose, 0) == "line 10",
+          "got \(row(loose, 0).debugDescription)")
+    let bottom = s.viewportSnapshot(scrollOffset: 0, heldSince: before.pushedRows)
+    check("the bottom is never held", bottom.scrollOffset == 0,
+          "offset \(bottom.scrollOffset)")
+
+    // History capped at five: the held line falls out of the ring, and the
+    // view stops at the oldest line left rather than past it.
+    let (r, rfeed) = buffer(cols: 20, rows: 3, scrollback: 5)
+    for i in 1...10 { rfeed("line \(i)\r\n") }
+    let rbefore = r.viewportSnapshot(scrollOffset: 2)
+    for i in 11...20 { rfeed("line \(i)\r\n") }
+    let rheld = r.viewportSnapshot(scrollOffset: 2, heldSince: rbefore.pushedRows)
+    check("a held line that leaves history parks the view at the top",
+          rheld.scrollOffset == rheld.scrollbackLines && row(rheld, 0) == "line 14",
+          "offset \(rheld.scrollOffset) of \(rheld.scrollbackLines), "
+          + "top \(row(rheld, 0).debugDescription)")
+
+    // A reflow renumbers scrolledRows — here from 8 down to 5, since the
+    // ring dropped three lines — but pushes nothing, so it can't move a
+    // held view.
+    let (w, wfeed) = buffer(cols: 20, rows: 3, scrollback: 5)
+    for i in 1...10 { wfeed("line \(i)\r\n") }
+    let wbefore = w.viewportSnapshot(scrollOffset: 2)
+    w.resize(cols: 30, rows: 3)
+    let wheld = w.viewportSnapshot(scrollOffset: 2, heldSince: wbefore.pushedRows)
+    check("a reflow isn't output", wheld.scrollOffset == 2 && row(wheld, 0) == "line 7",
+          "offset \(wheld.scrollOffset), top \(row(wheld, 0).debugDescription), "
+          + "scrolledRows \(wbefore.scrolledRows) → \(wheld.scrolledRows)")
+
+    feed("\u{1b}[3J")
+    let purged = s.viewportSnapshot(scrollOffset: 7, heldSince: held.pushedRows)
+    check("purging the history takes a held view back to the bottom",
+          purged.scrollOffset == 0, "offset \(purged.scrollOffset)")
+
+    // Jumping starts from the text on screen. The view sits on "$ two";
+    // output then carries the offset four rows past it, and measured from
+    // there the prompt above would be "$ two" itself.
+    let (p, pfeed) = buffer(cols: 20, rows: 3, scrollback: 100)
+    pfeed("\u{1b}]133;A\u{07}$ one\r\n")
+    for i in 1...5 { pfeed("a\(i)\r\n") }
+    pfeed("\u{1b}]133;A\u{07}$ two\r\n")
+    for i in 1...5 { pfeed("b\(i)\r\n") }
+    let pbefore = p.viewportSnapshot(scrollOffset: 4)
+    check("the view opens on the second prompt", row(pbefore, 0) == "$ two",
+          "got \(row(pbefore, 0).debugDescription)")
+    for i in 1...4 { pfeed("c\(i)\r\n") }
+    let jump = p.jumpToPromptOffset(direction: -1, from: 4, heldSince: pbefore.pushedRows)
+    let landed = jump.map { row(p.viewportSnapshot(scrollOffset: $0), 0) }
+    check("held, jumping up goes to the prompt above the one on screen",
+          landed == "$ one", "got \(landed.debugDescription)")
+}
+
 section("erase")
 do {
     let (s, feed) = buffer()
@@ -1122,6 +1192,8 @@ do {
           SettingsIndex.search("closing").first?.field == .warnOnClose)
     check("\"bell\" finds the bell toggle",
           SettingsIndex.search("bell").first?.field == .notifyOnBell)
+    check("\"autoscroll\" finds keeping your place",
+          SettingsIndex.search("autoscroll").first?.field == .keepScrollPosition)
 
     // The two settings that had no UI at all until now.
     check("the scrollback depth is reachable",

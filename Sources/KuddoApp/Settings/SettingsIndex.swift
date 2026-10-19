@@ -130,6 +130,8 @@ enum SettingsIndex {
               "clear cls wipe erase reset scrollback history undo destructive"),
         .init(.scrollbackLines, .general, "Lines kept per tab",
               "scrollback history buffer memory lines depth"),
+        .init(.keepScrollPosition, .general, "Keep my place when scrolled back",
+              "autoscroll auto-scroll scroll lock follow output bottom jump position pin freeze"),
         .init(.shellIntegration, .general, "Track the prompt and working directory",
               "shell integration osc 133 osc 7 prompt marks jump cwd zsh bash fish"),
 

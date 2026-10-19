@@ -323,13 +323,19 @@ package final class Session: TmuxCommandSink, TmuxPaneSink {
     /// the gate against a finished frame and then draw the *next* one — taken
     /// mid-redraw, with the child's erase applied and its repaint still to
     /// come. That renders as a flash of half-drawn screen.
-    func publishedFrame(scrollOffset: Int) -> (snapshot: TerminalSnapshot,
-                                               synchronizedUpdateActive: Bool) {
+    ///
+    /// `heldSince` keeps a scrolled-back view on its text; see
+    /// `TerminalState.viewportSnapshot`. It is applied here, on the queue, so
+    /// the rows output pushed are counted against the same state the frame is
+    /// composed from.
+    func publishedFrame(scrollOffset: Int,
+                        heldSince: Int?) -> (snapshot: TerminalSnapshot,
+                                             synchronizedUpdateActive: Bool) {
         if scrollOffset == 0, let value = publishedValue {
             return (value.snapshot, value.synchronizedUpdateActive)
         }
         return queue.sync {
-            (state.viewportSnapshot(scrollOffset: scrollOffset),
+            (state.viewportSnapshot(scrollOffset: scrollOffset, heldSince: heldSince),
              state.synchronizedUpdateActive)
         }
     }
@@ -366,10 +372,15 @@ package final class Session: TmuxCommandSink, TmuxPaneSink {
     }
 
     /// Returns a new scrollOffset that jumps to the nearest prompt above
-    /// (direction < 0) or below (direction > 0) the current viewport. Returns
-    /// nil if nothing to jump to.
-    func jumpToPrompt(direction: Int, from currentOffset: Int) -> Int? {
-        queue.sync { state.jumpToPromptOffset(direction: direction, from: currentOffset) }
+    /// (direction < 0) or below (direction > 0) the current viewport, with the
+    /// `pushedRows` it was measured against. Returns nil if nothing to jump to.
+    func jumpToPrompt(direction: Int, from currentOffset: Int,
+                      heldSince: Int?) -> (offset: Int, pushedRows: Int)? {
+        queue.sync {
+            state.jumpToPromptOffset(direction: direction, from: currentOffset,
+                                     heldSince: heldSince)
+                .map { ($0, state.pushedRows) }
+        }
     }
 
     /// Remaps any baked-in cell colors from the old theme to the new theme.

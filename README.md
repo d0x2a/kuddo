@@ -72,6 +72,7 @@ swift run -c release Kuddo
 - Profiles: a named command, starting directory, environment and optional pinned theme, edited in Settings and stored one JSON file each under `profiles/` so a profile can be shared or checked into a repo. Open one from `File > New Tab with Profile` or ⌘⌥1–9; ⌘T uses whichever is marked default. A profile that pins a theme keeps it whatever the system appearance does, so a production-ssh tab can look different from the rest.
 - Settings window organized into Appearance / Profiles / Triggers / General / Notifications panes, with a search field over the sidebar that finds a control by what it's called or by what you'd call it — "antialiasing" finds stroke weight, "history" finds the scrollback depth — and takes you to it with the focus ring on it.
 - Shell integration can be switched off in Settings, and the scrollback depth picked there too (1k–100k lines; the pane shows what each costs per tab).
+- Scrolled back, new output doesn't move the lines you're reading; at the bottom the view follows the output as usual. Off (General > Scrollback > Keep my place when scrolled back), the view instead stays a fixed distance from the bottom and the text scrolls past.
 
 ## Keyboard shortcuts
 

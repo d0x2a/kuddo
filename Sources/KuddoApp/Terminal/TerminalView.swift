@@ -45,12 +45,22 @@ final class TerminalView: NSView, CALayerDelegate {
     /// cell boundary doesn't re-announce the same dimensions.
     private var lastReportedGrid: (cols: Int, rows: Int)?
 
-    private var scrollOffset: Int = 0 {
-        didSet {
-            guard scrollOffset != oldValue else { return }
+    /// Rows the viewport sits above the bottom. Assigning it is a scroll, and
+    /// brings up the indicator; a frame that moves the viewport to keep its
+    /// text still writes `viewportOffset` instead, since that isn't one.
+    private var scrollOffset: Int {
+        get { viewportOffset }
+        set {
+            guard newValue != viewportOffset else { return }
+            viewportOffset = newValue
             showScrollIndicator()
         }
     }
+    private var viewportOffset = 0
+    /// `pushedRows` of the state `scrollOffset` was measured against — the
+    /// last frame's, or a jump's. What lets the next frame keep a
+    /// scrolled-back view on the text it is showing; see `nextFrame`.
+    private var heldSince = 0
     private var scrollResidue: CGFloat = 0
 
     /// Overlay scroll indicator: a capsule on the right edge that appears while
@@ -289,7 +299,7 @@ final class TerminalView: NSView, CALayerDelegate {
         // frame for the length of the drag. Held frames go out on the next
         // tick, the moment the update closes.
         needsFrame = true
-        guard let frame = session?.publishedFrame(scrollOffset: scrollOffset) else {
+        guard let frame = nextFrame() else {
             renderFrame(transactional: true)
             return
         }
@@ -992,12 +1002,25 @@ final class TerminalView: NSView, CALayerDelegate {
         // drawing, and presenting it regardless is what made a TUI's composer
         // blink out between its erase and its repaint. `needsFrame` stays set,
         // so the tick presents the finished frame when the update closes.
-        guard let frame = session?.publishedFrame(scrollOffset: scrollOffset) else {
+        guard let frame = nextFrame() else {
             renderFrame()
             return
         }
         if frame.synchronizedUpdateActive { return }
         renderFrame(using: frame.snapshot)
+    }
+
+    /// The frame to present next, or nil without a session. Keeping position,
+    /// a scrolled-back viewport is measured from the last frame and the
+    /// session moves it up past whatever output has pushed into history
+    /// since, so the text being read stays where it is; renderFrame adopts
+    /// where that left it.
+    private func nextFrame() -> (snapshot: TerminalSnapshot, synchronizedUpdateActive: Bool)? {
+        session?.publishedFrame(scrollOffset: scrollOffset, heldSince: heldSinceIfKeeping)
+    }
+
+    private var heldSinceIfKeeping: Int? {
+        ThemeStore.shared.settings.keepScrollPosition ? heldSince : nil
     }
 
     /// Maps a viewport row to its absolute line. The top visible line is
@@ -1321,22 +1344,26 @@ final class TerminalView: NSView, CALayerDelegate {
 
     private func scrollToMatch(_ match: SearchMatch) {
         guard let session else { return }
-        let scrolled = session.snapshot(scrollOffset: scrollOffset).scrolledRows
+        let live = session.snapshot(scrollOffset: scrollOffset)
+        let scrolled = live.scrolledRows
         if match.absoluteLine >= scrolled {
             scrollOffset = 0
         } else {
             let target = scrolled - match.absoluteLine
             scrollOffset = min(target, lastScrollbackLines)
         }
+        heldSince = live.pushedRows
         scrollResidue = 0
     }
 
     @objc func jumpToPreviousPrompt(_ sender: Any?) {
         invalidate()
         guard let session,
-              let newOffset = session.jumpToPrompt(direction: -1, from: scrollOffset)
+              let jump = session.jumpToPrompt(direction: -1, from: scrollOffset,
+                                              heldSince: heldSinceIfKeeping)
         else { return }
-        scrollOffset = newOffset
+        scrollOffset = jump.offset
+        heldSince = jump.pushedRows
         scrollResidue = 0
     }
 
@@ -1344,7 +1371,10 @@ final class TerminalView: NSView, CALayerDelegate {
         invalidate()
         guard let session else { return }
         // direction > 0 returns 0 if no prompt below — i.e. snap to bottom.
-        scrollOffset = session.jumpToPrompt(direction: 1, from: scrollOffset) ?? 0
+        let jump = session.jumpToPrompt(direction: 1, from: scrollOffset,
+                                        heldSince: heldSinceIfKeeping)
+        scrollOffset = jump?.offset ?? 0
+        if let jump { heldSince = jump.pushedRows }
         scrollResidue = 0
     }
 
@@ -1534,7 +1564,7 @@ final class TerminalView: NSView, CALayerDelegate {
         // The flag and the grid are taken together. Read separately, the queue
         // could publish a new frame between the two, so a tick that cleared the
         // gate against the finished frame went on to draw the half-drawn one.
-        guard let frame = session?.publishedFrame(scrollOffset: scrollOffset) else {
+        guard let frame = nextFrame() else {
             renderFrame()
             return
         }
@@ -1572,7 +1602,8 @@ final class TerminalView: NSView, CALayerDelegate {
                                 rowWrapped: [false],
                                 cursorCol: 0, cursorRow: 0, cursorVisible: false,
                                 scrollbackLines: 0, scrollOffset: 0, title: "",
-                                prompts: [], scrolledRows: 0, currentDirectory: nil,
+                                prompts: [], scrolledRows: 0, pushedRows: 0,
+                                currentDirectory: nil,
                                 usingAlt: false, links: [])
         lastScrollbackLines = snapshot.scrollbackLines
         lastSnapshotCols = snapshot.cols
@@ -1585,9 +1616,12 @@ final class TerminalView: NSView, CALayerDelegate {
             lastUsingAlt = snapshot.usingAlt
             activeSelection = nil
         }
-        if scrollOffset > lastScrollbackLines {
-            scrollOffset = lastScrollbackLines
-        }
+        // Where the frame actually put the viewport: inside the history there
+        // is — a purge takes it back to the bottom — and, keeping position,
+        // moved up past what output pushed since the last frame. Written past
+        // the setter: output moving the view isn't a scroll to show a thumb for.
+        viewportOffset = snapshot.scrollOffset
+        heldSince = snapshot.pushedRows
         // While it's on screen the thumb has to track output arriving under it.
         // Gated on the fade so tabs that have never been scrolled don't build
         // the indicator at all.

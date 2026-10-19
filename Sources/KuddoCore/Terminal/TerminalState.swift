@@ -80,6 +80,10 @@ package struct TerminalSnapshot {
     package let title: String              // last OSC 0/2 title from the shell
     package let prompts: [PromptMark]      // prompt markers currently visible in the viewport
     package let scrolledRows: Int          // total lines ever pushed to scrollback (for absolute coords)
+    /// `TerminalState.pushedRows` as of this snapshot. Hand it back to
+    /// `viewportSnapshot(scrollOffset:heldSince:)` to keep a scrolled-back
+    /// view on the text it is showing.
+    package let pushedRows: Int
     package let currentDirectory: String?  // last OSC 7 reported cwd
     package let usingAlt: Bool             // alt buffer is showing (vim, less, ...)
     /// OSC 8 hyperlink targets, indexed by `Cell.link` - 1. Empty until
@@ -100,6 +104,7 @@ package struct TerminalSnapshot {
                  title: String,
                  prompts: [PromptMark],
                  scrolledRows: Int,
+                 pushedRows: Int,
                  currentDirectory: String?,
                  usingAlt: Bool,
                  links: [String]) {
@@ -116,6 +121,7 @@ package struct TerminalSnapshot {
         self.title = title
         self.prompts = prompts
         self.scrolledRows = scrolledRows
+        self.pushedRows = pushedRows
         self.currentDirectory = currentDirectory
         self.usingAlt = usingAlt
         self.links = links
@@ -259,6 +265,15 @@ package final class TerminalState: ParserSink {
     // any row that has ever existed in the primary screen. Used by OSC 133
     // prompt markers so jump-to-prompt and gutter dots survive scrolling.
     private(set) var scrolledRows: Int = 0
+    /// Rows output has pushed into history, ever. `scrolledRows` counts the
+    /// same pushes but a reflow renumbers it; this only ever counts, so the
+    /// difference between two readings is exactly how far output has carried
+    /// the text up since the first.
+    ///
+    /// A computed accessor rather than package-visible storage, which would
+    /// cost the parser its exclusivity-check elimination.
+    package var pushedRows: Int { pushCount }
+    private var pushCount = 0
 
     private struct Prompt {
         let absoluteLine: Int
@@ -611,8 +626,16 @@ package final class TerminalState: ParserSink {
 
     /// Composes a `rows`-tall viewport. With scrollOffset=0 the viewport is the
     /// active grid. With scrollOffset>0 the top N rows come from scrollback.
-    package func viewportSnapshot(scrollOffset requested: Int) -> TerminalSnapshot {
-        let offset = max(0, min(requested, scrollbackCount))
+    ///
+    /// `heldSince` holds a scrolled-back viewport on its text. It is the
+    /// `pushedRows` of the snapshot the offset was measured against, and the
+    /// offset grows by every row output has pushed into history since — so
+    /// the lines being read stay put instead of riding the output up. The
+    /// snapshot's own scrollOffset says where that left the viewport. The
+    /// bottom is never held: offset 0 follows the output.
+    package func viewportSnapshot(scrollOffset requested: Int,
+                                  heldSince: Int? = nil) -> TerminalSnapshot {
+        let offset = max(0, min(heldOffset(requested, since: heldSince), scrollbackCount))
         if offset == 0 {
             return TerminalSnapshot(
                 cols: cols, rows: rows,
@@ -626,6 +649,7 @@ package final class TerminalState: ParserSink {
                 title: title,
                 prompts: visiblePrompts(offset: 0),
                 scrolledRows: scrolledRows,
+                pushedRows: pushedRows,
                 currentDirectory: currentDirectory,
                 usingAlt: usingAlt,
                 links: linkURIs
@@ -675,10 +699,18 @@ package final class TerminalState: ParserSink {
             title: title,
             prompts: visiblePrompts(offset: offset),
             scrolledRows: scrolledRows,
+            pushedRows: pushedRows,
             currentDirectory: currentDirectory,
             usingAlt: usingAlt,
             links: linkURIs
         )
+    }
+
+    /// `offset`, moved up past every row pushed into history since the
+    /// `pushedRows` reading `heldSince`. Unclamped; the caller bounds it.
+    private func heldOffset(_ offset: Int, since heldSince: Int?) -> Int {
+        guard let heldSince, offset > 0 else { return offset }
+        return offset + pushedRows - heldSince
     }
 
     // MARK: ParserSink
@@ -1581,9 +1613,12 @@ package final class TerminalState: ParserSink {
         }
     }
 
-    package func jumpToPromptOffset(direction: Int, from currentOffset: Int) -> Int? {
+    /// `heldSince` is as for `viewportSnapshot`: the jump starts from the text
+    /// on screen, not from where output has since carried the offset.
+    package func jumpToPromptOffset(direction: Int, from currentOffset: Int,
+                                    heldSince: Int? = nil) -> Int? {
         guard !prompts.isEmpty else { return nil }
-        let topAbs = scrolledRows - currentOffset
+        let topAbs = scrolledRows - heldOffset(currentOffset, since: heldSince)
         let bottomAbs = topAbs + rows
         if direction < 0 {
             // strictly above the current top
@@ -1996,6 +2031,7 @@ package final class TerminalState: ParserSink {
     private func pushToScrollback(_ lines: Int) {
         for r in 0..<lines { pushScrollbackRow(r) }
         scrolledRows += lines
+        pushCount += lines
         // Drop prompts that have fallen out of scrollback.
         let topOfHistory = scrolledRows - scrollbackCount
         if let firstKeep = prompts.firstIndex(where: { $0.absoluteLine >= topOfHistory }),

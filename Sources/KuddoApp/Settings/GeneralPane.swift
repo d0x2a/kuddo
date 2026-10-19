@@ -54,6 +54,16 @@ struct GeneralPane: View {
                 Text(scrollbackNote)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                Toggle("Keep my place when scrolled back",
+                       isOn: $store.settings.keepScrollPosition)
+                    .focusableControl(.keepScrollPosition, focus: $focus, onActivate: {
+                        store.settings.keepScrollPosition.toggle()
+                    })
+                Text("New output doesn't move the lines you're reading. Off, the view "
+                     + "stays the same distance from the bottom and the text scrolls "
+                     + "past. At the bottom, the view always follows the output.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Section("Shell Integration") {

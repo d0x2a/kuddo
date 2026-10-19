@@ -80,6 +80,11 @@ package struct AppSettings: Codable, Equatable {
     /// isn't one of these is still honoured; the picker just shows it as an
     /// extra entry.
     package static let scrollbackChoices = [1_000, 5_000, 10_000, 25_000, 50_000, 100_000]
+    /// Scrolled back, keep the text being read where it is while output
+    /// arrives, the way Terminal.app and iTerm2 do. Off, the view stays the
+    /// same number of rows above the bottom and the text rides up with the
+    /// output. Either way a view at the bottom follows it.
+    package var keepScrollPosition: Bool = true
 
     /// Whether new shells get Kuddo's prompt hooks (OSC 133 / OSC 7). Off,
     /// the shell starts exactly as it would from any other terminal and
@@ -95,7 +100,8 @@ package struct AppSettings: Codable, Equatable {
              warnOnCloseWithRunningProcess,
              confirmClearScreen,
              notificationsEnabled, notifyOnBell, notifyOnlyWhenUnfocused,
-             scrollbackLines, shellIntegrationEnabled, defaultProfileId
+             scrollbackLines, keepScrollPosition, shellIntegrationEnabled,
+             defaultProfileId
         /// Read-only key for migrating old settings; we never write it back.
         case thinStrokes
     }
@@ -117,6 +123,7 @@ package struct AppSettings: Codable, Equatable {
         try c.encode(notifyOnBell, forKey: .notifyOnBell)
         try c.encode(notifyOnlyWhenUnfocused, forKey: .notifyOnlyWhenUnfocused)
         try c.encode(scrollbackLines, forKey: .scrollbackLines)
+        try c.encode(keepScrollPosition, forKey: .keepScrollPosition)
         try c.encode(shellIntegrationEnabled, forKey: .shellIntegrationEnabled)
         try c.encodeIfPresent(defaultProfileId, forKey: .defaultProfileId)
     }
@@ -165,6 +172,8 @@ package struct AppSettings: Codable, Equatable {
         // and a number in the millions would be a typo with a memory bill.
         let lines = try c.decodeIfPresent(Int.self, forKey: .scrollbackLines) ?? 10_000
         self.scrollbackLines = min(max(lines, 100), 1_000_000)
+        self.keepScrollPosition =
+            try c.decodeIfPresent(Bool.self, forKey: .keepScrollPosition) ?? true
         self.shellIntegrationEnabled =
             try c.decodeIfPresent(Bool.self, forKey: .shellIntegrationEnabled) ?? true
         self.defaultProfileId = try c.decodeIfPresent(String.self, forKey: .defaultProfileId)
