@@ -1720,5 +1720,80 @@ do {
           quote(list.snapshot(), 6, 1)?.text.debugDescription ?? "nil")
 }
 
+section("fenced code")
+do {
+    func code(_ s: TerminalSnapshot, _ col: Int, _ row: Int) -> String? {
+        FencedCodeDetector.block(at: (col, row), snapshot: s)?.text
+    }
+    func rowIndex(_ s: TerminalSnapshot, containing text: String) -> Int {
+        (0..<s.rows).first { row(s, $0).contains(text) } ?? -1
+    }
+
+    // The block from the user's ask, as a program that prints markdown as it
+    // is shows it: the fences on screen, prose around them.
+    let (plain, feedPlain) = buffer(cols: 40, rows: 9)
+    feedPlain("Run this:\r\n\r\n```sql\r\nCODE GOES HERE\r\nMULTILINE\r\n```\r\n\r\nThen tell me.")
+    let ps = plain.snapshot()
+    let sql = "CODE GOES HERE\nMULTILINE"
+    check("a line of the code copies the code without its fences", code(ps, 3, 3) == sql,
+          code(ps, 3, 3).debugDescription)
+    check("so does the space past a line's end", code(ps, 30, 4) == sql)
+    check("and either fence", code(ps, 0, 2) == sql && code(ps, 1, 5) == sql)
+    check("the prose above isn't code", code(ps, 0, 0) == nil && code(ps, 0, 1) == nil)
+    check("nor the prose below", code(ps, 0, 6) == nil && code(ps, 2, 7) == nil)
+    check("marked on the code's rows, not the fences",
+          FencedCodeDetector.block(at: (0, 3), snapshot: ps)?.segments.map(\.row) == [3, 4])
+    check("in the code's colour",
+          FencedCodeDetector.block(at: (0, 3), snapshot: ps)?.color == PackedColor(ThemeStore.currentTheme.foreground))
+
+    // Inside a list item: the fence's indent comes off, the code's own stays,
+    // and a blank line inside the block is kept.
+    let (list, feedList) = buffer(cols: 40, rows: 10)
+    feedList("1. Make it:\r\n\r\n   ```sql\r\n   CREATE TABLE t (\r\n     id int\r\n   );\r\n\r\n   SELECT 1;\r\n   ```\r\n")
+    let ls = list.snapshot()
+    let create = rowIndex(ls, containing: "CREATE")
+    check("an indented block copies flush left and keeps its own indent",
+          code(ls, 5, create) == "CREATE TABLE t (\n  id int\n);\n\nSELECT 1;",
+          code(ls, 5, create).debugDescription)
+    check("left of the fence is not the block", code(ls, 1, create) == nil)
+
+    // A line too long for the terminal wraps, and copies as the one line.
+    let long = "SELECT a, b, c FROM some_table WHERE x = 1;"
+    let (wrapped, feedWrapped) = buffer(cols: 20, rows: 7)
+    feedWrapped("```sql\r\n\(long)\r\nSELECT 2;\r\n```\r\n")
+    check("a line the terminal wrapped copies whole", code(wrapped.snapshot(), 0, 2) == "\(long)\nSELECT 2;",
+          code(wrapped.snapshot(), 0, 2).debugDescription)
+
+    // Scrolled so the top of one block is off the screen: its closer is the
+    // first fence there, and must not open a block over the prose below it.
+    let (cut, feedCut) = buffer(cols: 40, rows: 8)
+    feedCut("tail of code\r\n```\r\n\r\nNext:\r\n\r\n```sql\r\nSELECT 3;\r\n```")
+    let cs = cut.snapshot()
+    check("a closer whose opener scrolled off doesn't open a block",
+          code(cs, 0, rowIndex(cs, containing: "Next:")) == nil)
+    check("its own code isn't a block either", code(cs, 0, 0) == nil)
+    check("the block after it still copies", code(cs, 0, rowIndex(cs, containing: "SELECT 3")) == "SELECT 3;")
+
+    // The bottom cut off instead: a block that hasn't closed on screen is
+    // only part of the code.
+    let (open, feedOpen) = buffer(cols: 40, rows: 3)
+    feedOpen("```sql\r\nSELECT 4;\r\nSELECT 5;")
+    check("a block with no closer on screen isn't copied", code(open.snapshot(), 0, 1) == nil)
+
+    // A longer fence holds a shorter one as code; ~~~ fences work the same.
+    let (nested, feedNested) = buffer(cols: 40, rows: 9)
+    feedNested("````md\r\n```sql\r\nSELECT 6;\r\n```\r\n````\r\n\r\n~~~\r\nSELECT 7;\r\n~~~")
+    let ns = nested.snapshot()
+    check("a shorter fence inside a longer one is code", code(ns, 0, 2) == "```sql\nSELECT 6;\n```",
+          code(ns, 0, 2).debugDescription)
+    check("tildes fence a block too", code(ns, 0, 7) == "SELECT 7;")
+
+    // Three backticks opening inline code are not a fence.
+    let (inline, feedInline) = buffer(cols: 40, rows: 4)
+    feedInline("```x``` is inline\r\nSELECT 8;\r\n```\r\nSELECT 9;")
+    let isn = inline.snapshot()
+    check("inline code isn't a fence", code(isn, 0, 0) == nil && code(isn, 0, 1) == nil)
+}
+
 print("\n\(failures == 0 ? "all checks passed" : "\(failures) check(s) FAILED")")
 exit(failures == 0 ? 0 : 1)

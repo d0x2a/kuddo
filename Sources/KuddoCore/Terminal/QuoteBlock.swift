@@ -75,7 +75,7 @@ package enum QuoteBlockDetector {
 
         return ColorRun(segments: spans.map { .init(row: $0.row, col: $0.lo, length: $0.hi - $0.lo + 1) },
                         text: text,
-                        color: textColor(grid, spans))
+                        color: grid.dominantForeground(spans))
     }
 
     /// The column of the bar that opens `row`, if one does: the row's first
@@ -101,17 +101,5 @@ package enum QuoteBlockDetector {
         guard let mark = word.last, mark == "." || mark == ")" else { return false }
         let number = word.dropLast()
         return !number.isEmpty && number.allSatisfy { $0.isASCII && $0.isNumber }
-    }
-
-    /// The colour most of the quote's text is in, for the tint and the sheet's
-    /// preview: a bold heading or a coloured word inside shouldn't set it.
-    private static func textColor(_ grid: Grid, _ spans: [Span]) -> PackedColor {
-        var counts: [PackedColor: Int] = [:]
-        for span in spans {
-            for col in span.lo...span.hi where !grid.isBlank(span.row, col) {
-                counts[grid.cell(span.row, col).fg, default: 0] += 1
-            }
-        }
-        return counts.max { $0.value < $1.value }?.key ?? grid.cell(spans[0].row, spans[0].lo).fg
     }
 }

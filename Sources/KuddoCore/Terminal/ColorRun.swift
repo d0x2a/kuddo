@@ -223,7 +223,7 @@ package enum ColorRunDetector {
     // MARK: - grid reading
     //
     // Shared with QuoteBlockDetector, which rejoins a quote's rows by the
-    // same rules a run's are.
+    // same rules a run's are, and FencedCodeDetector.
 
     struct Key: Equatable {
         let fg: PackedColor
@@ -393,6 +393,19 @@ package enum ColorRunDetector {
                 out.unicodeScalars.append(cell(span.row, col).scalar)
             }
             return out
+        }
+
+        /// The colour most of the text in these spans is in, for the tint and
+        /// the sheet's preview of a passage that isn't one colour: a bold
+        /// heading in a quote, or a highlighted keyword in code, shouldn't set it.
+        func dominantForeground(_ spans: [Span]) -> PackedColor {
+            var counts: [PackedColor: Int] = [:]
+            for span in spans {
+                for col in span.lo...span.hi where !isBlank(span.row, col) {
+                    counts[cell(span.row, col).fg, default: 0] += 1
+                }
+            }
+            return counts.max { $0.value < $1.value }?.key ?? cell(spans[0].row, spans[0].lo).fg
         }
     }
 }

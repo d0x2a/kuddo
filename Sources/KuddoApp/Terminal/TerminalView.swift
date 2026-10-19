@@ -671,7 +671,10 @@ final class TerminalView: NSView, CALayerDelegate {
 
     /// Inside a quote, the quote: it is the passage someone set apart, and a
     /// coloured word or a row that reads as a command inside it is a piece of
-    /// that passage. It comes as a run, marked and confirmed like one.
+    /// that passage. It comes as a run, marked and confirmed like one. The
+    /// same goes for the code between a pair of ``` fences, whose extent the
+    /// fences state outright: a highlighted keyword or a line of shell in it
+    /// is a piece of the code.
     ///
     /// Elsewhere a cell can read as both a command block and a coloured run.
     /// The block wins unless the run takes in every character of it: then the
@@ -680,6 +683,7 @@ final class TerminalView: NSView, CALayerDelegate {
     private func copyTarget(at coord: (col: Int, row: Int),
                             snapshot: TerminalSnapshot) -> CopyTarget? {
         if let quote = QuoteBlockDetector.quote(at: coord, snapshot: snapshot) { return .run(quote) }
+        if let code = FencedCodeDetector.block(at: coord, snapshot: snapshot) { return .run(code) }
         let block = commandBlock(at: coord, snapshot: snapshot)
         guard let run = colorRun(at: coord, snapshot: snapshot) else {
             return block.map { .block($0) }
