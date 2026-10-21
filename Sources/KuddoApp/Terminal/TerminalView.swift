@@ -165,6 +165,12 @@ final class TerminalView: NSView, CALayerDelegate {
     private var pendingCopyRun: ColorRun?
     private var runCopySheet: RunCopySheet?
     private static let runTintAlpha: Float = 0.18
+    /// The link ⌘⇧-click just copied, marked brighter for a moment: with no
+    /// sheet to confirm it, that's the only sign the copy happened. Drawn
+    /// whether or not the keys are still down.
+    private var copiedLinkFlash: [HighlightBand] = []
+    private var copiedLinkFlashEnd: DispatchWorkItem?
+    private static let copiedLinkFlashAlpha: Float = 0.35
     /// Memo for evaluateTriggers. Kept separate from currentTriggerMatches,
     /// which is cleared whenever ⌘ comes up — reusing that as the memo would
     /// hand back an empty result the next time ⌘ went down on an unchanged
@@ -402,9 +408,7 @@ final class TerminalView: NSView, CALayerDelegate {
             }
             if let match = triggerMatch(at: coord) {
                 if mods.contains(.shift), let url = copyableURL(match) {
-                    let pb = NSPasteboard.general
-                    pb.clearContents()
-                    pb.setString(url, forType: .string)
+                    copyLink(url, of: match)
                 } else {
                     handleTriggerClick(match)
                 }
@@ -887,6 +891,30 @@ final class TerminalView: NSView, CALayerDelegate {
         return openableURL(match.text)?.absoluteString
     }
 
+    private func copyLink(_ url: String, of match: TriggerMatch) {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(url, forType: .string)
+
+        var flash = lastAppliedTheme.linkAccent
+        flash.w = Self.copiedLinkFlashAlpha
+        copiedLinkFlash = currentTriggerMatches.filter { $0.id == match.id }.map {
+            HighlightBand(col: $0.viewportCol,
+                          row: $0.viewportRow,
+                          length: $0.length,
+                          color: flash,
+                          style: .background)
+        }
+        copiedLinkFlashEnd?.cancel()
+        let end = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.copiedLinkFlash = []
+            self.invalidate()
+        }
+        copiedLinkFlashEnd = end
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: end)
+    }
+
     /// Opens a link that arrived as an OSC 8. The scheme was checked when the
     /// sequence was parsed, so this only has to decide between opening and
     /// revealing: a `file://` is revealed for the same reason matched paths are
@@ -948,11 +976,6 @@ final class TerminalView: NSView, CALayerDelegate {
             commandHeld = cmd
             if cmd { refreshTriggerMatches() }
             updateCursorAffordance()
-        } else if cmd {
-            // ⇧ with ⌘ held turns the hand over a link into the copy arrow.
-            // Not done without ⌘: ⇧ goes down for every capital typed, and the
-            // pointer may be over the sidebar, not here.
-            updateCursorAffordance()
         }
     }
 
@@ -991,11 +1014,7 @@ final class TerminalView: NSView, CALayerDelegate {
         if commandHeld,
            let match = hoveredTriggerMatch(),
            match.trigger.clickAction != nil {
-            if NSEvent.modifierFlags.contains(.shift), copyableURL(match) != nil {
-                NSCursor.dragCopy.set()
-            } else {
-                NSCursor.pointingHand.set()
-            }
+            NSCursor.pointingHand.set()
         } else {
             NSCursor.iBeam.set()
         }
@@ -1750,23 +1769,37 @@ final class TerminalView: NSView, CALayerDelegate {
             // of the marking is the extent of what opens.
             if let hovered = hoveredTriggerMatch(), hovered.trigger.clickAction != nil {
                 let accent = lastAppliedTheme.linkAccent
+                // Text and rule in the same colour, so the link reads as one
+                // object rather than as text with something drawn under it.
+                // Two bands rather than one combined style: they're
+                // independent effects and compose in the renderer.
+                //
+                // With ⇧ added the click copies the link rather than opening
+                // it, and the rule gives way to a faint tint behind it — the
+                // mark every other ⌘-click copy has. Read live, not tracked
+                // like ⌘: flagsChanged asks for a frame on any modifier.
+                var tint = accent
+                tint.w = Self.runTintAlpha
+                let marks: [(HighlightStyle, SIMD4<Float>)] =
+                    NSEvent.modifierFlags.contains(.shift) && copyableURL(hovered) != nil
+                        ? [(.background, tint), (.text, accent)]
+                        : [(.underline, accent), (.text, accent)]
                 for m in currentTriggerMatches where m.id == hovered.id {
-                    // Text and rule in the same colour, so the link reads as
-                    // one object rather than as text with something drawn
-                    // under it. Two bands rather than one combined style:
-                    // they're independent effects and compose in the renderer.
-                    for style in [HighlightStyle.underline, .text] {
+                    for (style, color) in marks {
                         bands.append(HighlightBand(
                             col: m.viewportCol,
                             row: m.viewportRow,
                             length: m.length,
-                            color: accent,
+                            color: color,
                             style: style
                         ))
                     }
                 }
             }
         }
+
+        // Outside the ⌘ gate: the keys may be up before the flash ends.
+        bands.append(contentsOf: copiedLinkFlash)
 
         // Search highlights — current match brighter than the rest.
         if let search = search {
