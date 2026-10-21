@@ -401,7 +401,13 @@ final class TerminalView: NSView, CALayerDelegate {
                 refreshTriggerMatches()
             }
             if let match = triggerMatch(at: coord) {
-                handleTriggerClick(match)
+                if mods.contains(.shift), let url = copyableURL(match) {
+                    let pb = NSPasteboard.general
+                    pb.clearContents()
+                    pb.setString(url, forType: .string)
+                } else {
+                    handleTriggerClick(match)
+                }
                 return                       // don't start a selection
             }
             if let session {
@@ -866,6 +872,21 @@ final class TerminalView: NSView, CALayerDelegate {
         }
     }
 
+    /// What ⌘⇧-click puts on the pasteboard in place of opening a link: the
+    /// address ⌘-click would hand the browser, scheme and all, so
+    /// `localhost:3000` pastes as something a browser takes. Nil for anything
+    /// ⌘-click wouldn't open as a URL — a path is still revealed and a command
+    /// still runs, since neither is an address — and an OSC 8 `file://` counts
+    /// as a path.
+    private func copyableURL(_ match: TriggerMatch) -> String? {
+        if let uri = match.hyperlink {
+            guard let url = URL(string: uri), !url.isFileURL else { return nil }
+            return uri
+        }
+        guard match.trigger.clickAction == .openURL else { return nil }
+        return openableURL(match.text)?.absoluteString
+    }
+
     /// Opens a link that arrived as an OSC 8. The scheme was checked when the
     /// sequence was parsed, so this only has to decide between opening and
     /// revealing: a `file://` is revealed for the same reason matched paths are
@@ -927,6 +948,11 @@ final class TerminalView: NSView, CALayerDelegate {
             commandHeld = cmd
             if cmd { refreshTriggerMatches() }
             updateCursorAffordance()
+        } else if cmd {
+            // ⇧ with ⌘ held turns the hand over a link into the copy arrow.
+            // Not done without ⌘: ⇧ goes down for every capital typed, and the
+            // pointer may be over the sidebar, not here.
+            updateCursorAffordance()
         }
     }
 
@@ -965,7 +991,11 @@ final class TerminalView: NSView, CALayerDelegate {
         if commandHeld,
            let match = hoveredTriggerMatch(),
            match.trigger.clickAction != nil {
-            NSCursor.pointingHand.set()
+            if NSEvent.modifierFlags.contains(.shift), copyableURL(match) != nil {
+                NSCursor.dragCopy.set()
+            } else {
+                NSCursor.pointingHand.set()
+            }
         } else {
             NSCursor.iBeam.set()
         }
