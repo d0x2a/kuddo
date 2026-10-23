@@ -407,8 +407,8 @@ final class TerminalView: NSView, CALayerDelegate {
                 refreshTriggerMatches()
             }
             if let match = triggerMatch(at: coord) {
-                if mods.contains(.shift), let url = copyableURL(match) {
-                    copyLink(url, of: match)
+                if mods.contains(.shift), let text = copyableLink(match) {
+                    copyLink(text, of: match)
                 } else if mods.contains(.option), let folder = linkedDirectory(match) {
                     delegate?.terminalView(self, didRequestTabAt: folder)
                 } else {
@@ -878,19 +878,27 @@ final class TerminalView: NSView, CALayerDelegate {
         }
     }
 
-    /// What ⌘⇧-click puts on the pasteboard in place of opening a link: the
-    /// address ⌘-click would hand the browser, scheme and all, so
-    /// `localhost:3000` pastes as something a browser takes. Nil for anything
-    /// ⌘-click wouldn't open as a URL — a path is still revealed and a command
-    /// still runs, since neither is an address — and an OSC 8 `file://` counts
-    /// as a path.
-    private func copyableURL(_ match: TriggerMatch) -> String? {
+    /// What ⌘⇧-click puts on the pasteboard in place of opening a link: what
+    /// ⌘-click would have acted on. For a URL that is the address it would
+    /// hand the browser, scheme and all, so `localhost:3000` pastes as
+    /// something a browser takes. For a path it is the absolute path Finder
+    /// would be shown, so a relative match pastes the same in any directory,
+    /// and the `:line` of a compiler reference is left behind with it. An
+    /// OSC 8 copies its target, a `file://` as a path. Nil for a trigger that
+    /// runs a command: what that click does is not an address.
+    private func copyableLink(_ match: TriggerMatch) -> String? {
         if let uri = match.hyperlink {
-            guard let url = URL(string: uri), !url.isFileURL else { return nil }
-            return uri
+            guard let url = URL(string: uri) else { return nil }
+            return url.isFileURL ? url.path : uri
         }
-        guard match.trigger.clickAction == .openURL else { return nil }
-        return openableURL(match.text)?.absoluteString
+        switch match.trigger.clickAction {
+        case .openURL:
+            return openableURL(match.text)?.absoluteString
+        case .revealFile:
+            return resolveFilePath(match.text, cwd: session?.currentDirectory)
+        case .runCommand, nil:
+            return nil
+        }
     }
 
     /// The folder ⌘⌥-click opens a tab in: a matched path, or an OSC 8
@@ -915,10 +923,10 @@ final class TerminalView: NSView, CALayerDelegate {
         return path
     }
 
-    private func copyLink(_ url: String, of match: TriggerMatch) {
+    private func copyLink(_ text: String, of match: TriggerMatch) {
         let pb = NSPasteboard.general
         pb.clearContents()
-        pb.setString(url, forType: .string)
+        pb.setString(text, forType: .string)
 
         var flash = lastAppliedTheme.linkAccent
         flash.w = Self.copiedLinkFlashAlpha
@@ -1805,7 +1813,7 @@ final class TerminalView: NSView, CALayerDelegate {
                 var tint = accent
                 tint.w = Self.runTintAlpha
                 let marks: [(HighlightStyle, SIMD4<Float>)] =
-                    NSEvent.modifierFlags.contains(.shift) && copyableURL(hovered) != nil
+                    NSEvent.modifierFlags.contains(.shift) && copyableLink(hovered) != nil
                         ? [(.background, tint), (.text, accent)]
                         : [(.underline, accent), (.text, accent)]
                 for m in currentTriggerMatches where m.id == hovered.id {
