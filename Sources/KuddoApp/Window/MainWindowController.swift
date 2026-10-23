@@ -14,6 +14,8 @@ protocol TerminalViewDelegate: AnyObject {
     func terminalViewDidTerminate(_ view: TerminalView)
     func terminalView(_ view: TerminalView, didRequestAttention attention: TerminalAttention)
     func terminalView(_ view: TerminalView, didResizeGridTo cols: Int, rows: Int)
+    /// ⌘⌥-click on a link to a folder: open a tab there.
+    func terminalView(_ view: TerminalView, didRequestTabAt directory: String)
     /// The child in this tab is speaking tmux control mode.
     func terminalView(_ view: TerminalView, didReceiveTmuxEvent event: TmuxEvent)
 }
@@ -462,6 +464,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate,
     func terminalViewDidTerminate(_ view: TerminalView) {
         guard let tab = tabs.first(where: { $0.terminalView === view }) else { return }
         forceCloseTab(tab.id)
+    }
+
+    /// Always a local shell, even in tmux control mode, for the reason a
+    /// folder from `kuddo <folder>` is: the link was offered because the
+    /// folder exists on this Mac, and the tmux server may not be on it.
+    func terminalView(_ view: TerminalView, didRequestTabAt directory: String) {
+        newTab(initialCwd: directory)
     }
 
     func terminalView(_ view: TerminalView, didRequestAttention attention: TerminalAttention) {

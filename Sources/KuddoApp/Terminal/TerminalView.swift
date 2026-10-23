@@ -409,6 +409,8 @@ final class TerminalView: NSView, CALayerDelegate {
             if let match = triggerMatch(at: coord) {
                 if mods.contains(.shift), let url = copyableURL(match) {
                     copyLink(url, of: match)
+                } else if mods.contains(.option), let folder = linkedDirectory(match) {
+                    delegate?.terminalView(self, didRequestTabAt: folder)
                 } else {
                     handleTriggerClick(match)
                 }
@@ -889,6 +891,28 @@ final class TerminalView: NSView, CALayerDelegate {
         }
         guard match.trigger.clickAction == .openURL else { return nil }
         return openableURL(match.text)?.absoluteString
+    }
+
+    /// The folder ⌘⌥-click opens a tab in: a matched path, or an OSC 8
+    /// `file://`, that names a directory. Nil for anything else, a file
+    /// included, which ⌘⌥-click then treats as a plain ⌘-click.
+    private func linkedDirectory(_ match: TriggerMatch) -> String? {
+        let path: String
+        if let uri = match.hyperlink {
+            guard let url = URL(string: uri), url.isFileURL else { return nil }
+            path = url.path
+        } else {
+            guard match.trigger.clickAction == .revealFile,
+                  let resolved = resolveFilePath(match.text,
+                                                 cwd: session?.currentDirectory)
+            else { return nil }
+            path = resolved
+        }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
+              isDirectory.boolValue
+        else { return nil }
+        return path
     }
 
     private func copyLink(_ url: String, of match: TriggerMatch) {
