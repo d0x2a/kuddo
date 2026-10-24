@@ -1660,7 +1660,7 @@ final class TerminalView: NSView, CALayerDelegate {
         let focused = window?.isKeyWindow ?? false
         guard focused != lastReportedFocus else { return }
         lastReportedFocus = focused
-        invalidate()          // the cursor only draws in a focused window
+        invalidate()          // the cursor fills when focused, outlines when not
         guard let session, session.inputModes.reportFocus else { return }
         session.write(Array((focused ? "\u{1B}[I" : "\u{1B}[O").utf8))
     }
@@ -1861,8 +1861,11 @@ final class TerminalView: NSView, CALayerDelegate {
     /// cursor still: the idle dirty check in `tick` treats the blink phase as
     /// the one thing that legitimately changes on a timer, so a steady cursor
     /// also stops the two redraws a second an otherwise idle screen was doing.
+    /// Steady in an unfocused window: the outline cursor there doesn't blink,
+    /// and a blink phase it ignores would only wake the tick to redraw nothing.
     private func cursorBlinkOn() -> Bool {
-        guard ThemeStore.shared.settings.blinkCursor else { return true }
+        guard ThemeStore.shared.settings.blinkCursor,
+              window?.isKeyWindow ?? false else { return true }
         let elapsed = CACurrentMediaTime() - lastInputTime
         if elapsed < 0.5 { return true }
         let cyclePos = (elapsed - 0.5).truncatingRemainder(dividingBy: 1.06)

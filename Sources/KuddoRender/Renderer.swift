@@ -265,6 +265,7 @@ package final class Renderer {
         // selection/cursor so those overlay on top.
         let underlineThickness = max(1, layout.scale)
         let underlineInset     = max(1, layout.scale)
+        let cursorOutline      = max(1, layout.scale)
         // Anchored to the glyph box, not the cell, so extra line height pads
         // the row without pushing underlines away from the characters.
         let underlineTop = layout.glyphBoxTop + layout.glyphBoxHeight
@@ -362,8 +363,19 @@ package final class Renderer {
                     }
                     if isCursor && focused && cursorOn {
                         flatScratch.append(FlatInstance(pos: cellRect.pos, size: cellRect.size, color: cursorColor))
+                    } else if isCursor && !focused {
+                        // An unfocused window keeps the cursor as an outline, so
+                        // where typing would land stays visible without claiming
+                        // focus. Drawn inside the cell, the glyph keeps its colour.
+                        let t = cursorOutline
+                        let (x, y) = (cellRect.pos.x, cellRect.pos.y)
+                        let (w, h) = (cellRect.size.x, cellRect.size.y)
+                        flatScratch.append(FlatInstance(pos: SIMD2(x, y), size: SIMD2(w, t), color: cursorColor))
+                        flatScratch.append(FlatInstance(pos: SIMD2(x, y + h - t), size: SIMD2(w, t), color: cursorColor))
+                        flatScratch.append(FlatInstance(pos: SIMD2(x, y + t), size: SIMD2(t, h - 2 * t), color: cursorColor))
+                        flatScratch.append(FlatInstance(pos: SIMD2(x + w - t, y + t), size: SIMD2(t, h - 2 * t), color: cursorColor))
                     }
-                    // Otherwise: unfocused window or "off" half of the blink → no cursor.
+                    // Otherwise: "off" half of the blink → no cursor.
 
                     // SGR underline. Emitted before the blank-cell skips below,
                     // because an underlined run has to stay unbroken across the
