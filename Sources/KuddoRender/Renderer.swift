@@ -35,6 +35,26 @@ private struct Uniforms {
     var colorAtlasSize: SIMD2<Float>
 }
 
+/// Must match the shader's `SurroundParams`.
+private struct SurroundParams {
+    var pattern: UInt32
+    var period: Float
+    var weight: Float
+}
+
+/// What fills the part of the drawable a grid doesn't reach when its session
+/// is held at a size other than the window's — an external client's, say.
+/// The window's own grid always fills it, so this only ever appears for a
+/// held one.
+package enum SurroundPattern: UInt32 {
+    /// A faint wash and the edge, no pattern.
+    case plain = 0
+    /// Fine 45° lines.
+    case stripes = 1
+    /// A staggered grid of dots.
+    case dots = 2
+}
+
 package enum HighlightStyle {
     case background    // full-cell tint behind the glyph
     case underline     // thin line at the bottom of the cell
@@ -101,6 +121,25 @@ package struct GridLayout {
     /// right padding. `margin` is 8pt in device pixels, so this is already on a
     /// pixel boundary — nothing to round.
     package var origin: SIMD2<Float> { SIMD2<Float>(margin, margin) }
+
+    /// The box a grid of `cols` × `rows` fills — the grid and its margin all
+    /// round, where a window exactly its size would end.
+    package func boxSize(cols: Int, rows: Int) -> SIMD2<Float> {
+        SIMD2(2 * margin + Float(cols) * cellWidth, 2 * margin + Float(rows) * cellHeight)
+    }
+
+    /// How far to move a grid of `cols` × `rows` from the top-left so its box
+    /// sits in the middle of the viewport, for a grid held smaller than its
+    /// window. Nothing along an axis the grid fills or overflows, and whole
+    /// pixels, so the glyphs stay on the pixel grid.
+    ///
+    /// Unlike `origin`, this moves the text during a live resize. A held grid
+    /// is a fixed size by definition, so it slides as a block, which reads as
+    /// the box being kept centred rather than as the text jittering.
+    package func centringOffset(cols: Int, rows: Int, viewportPixels: SIMD2<Float>) -> SIMD2<Float> {
+        let spare = viewportPixels - boxSize(cols: cols, rows: rows)
+        return SIMD2(max(0, (spare.x / 2).rounded(.down)), max(0, (spare.y / 2).rounded(.down)))
+    }
 }
 
 package final class Renderer {
@@ -108,6 +147,7 @@ package final class Renderer {
     private let commandQueue: MTLCommandQueue
     private let glyphPipeline: MTLRenderPipelineState
     private let flatPipeline: MTLRenderPipelineState
+    private let surroundPipeline: MTLRenderPipelineState
     private let sampler: MTLSamplerState
     private let glyphAtlas: GlyphAtlas
     private let font: CTFont
@@ -196,6 +236,10 @@ package final class Renderer {
             device: device, library: library, pixelFormat: pixelFormat,
             vertexName: "flatVertex", fragmentName: "flatFragment", blended: true
         )
+        self.surroundPipeline = Self.makePipeline(
+            device: device, library: library, pixelFormat: pixelFormat,
+            vertexName: "flatVertex", fragmentName: "surroundFragment", blended: true
+        )
 
         // Nearest filtering: glyph positions are integer-snapped (see
         // GlyphAtlas.rasterize + the integer ascent / origin below), so we
@@ -244,6 +288,7 @@ package final class Renderer {
 
     /// Fills `flatScratch` and `glyphScratch` with this frame's instances.
     private func buildInstances(from snapshot: TerminalSnapshot,
+                                origin: SIMD2<Float>,
                                 selection: Selection?,
                                 highlights: [HighlightBand],
                                 focused: Bool,
@@ -256,7 +301,6 @@ package final class Renderer {
         let cellWidth = layout.cellWidth
         let cellHeight = layout.cellHeight
         let ascent = layout.ascent
-        let origin = layout.origin
 
         let cursorColor = theme.cursor
         let defaultBg = PackedColor(theme.background)
@@ -443,6 +487,74 @@ package final class Renderer {
     }
 
 
+    /// Fills the drawable around the grid's box (`GridLayout.boxSize`, its
+    /// top-left at `offset`): a faint wash of the foreground, the pattern over
+    /// that, and a hairline round the box, so the eye can tell the end of the
+    /// grid from blank cells. Drawn from the frame's own snapshot, it moves in
+    /// step with the text it surrounds. Along an axis the grid fills, or
+    /// overflows, there is nothing to fill.
+    private func encodeSurround(_ pattern: SurroundPattern,
+                                into enc: MTLRenderCommandEncoder,
+                                cols: Int, rows: Int,
+                                at offset: SIMD2<Float>,
+                                drawableSize: CGSize,
+                                theme: Theme,
+                                uniforms: inout Uniforms) {
+        let w = Float(drawableSize.width)
+        let h = Float(drawableSize.height)
+        let box = layout.boxSize(cols: cols, rows: rows)
+        let (left, top) = (offset.x, offset.y)
+        let right = left + box.x
+        let bottom = top + box.y
+        // The box's rows, as far as they are on screen, for the side strips.
+        let sideHeight = min(bottom, h) - top
+        guard left > 0 || top > 0 || right < w || bottom < h else { return }
+
+        let fg = theme.foreground
+        func ink(_ alpha: Float) -> SIMD4<Float> { SIMD4(fg.x, fg.y, fg.z, alpha) }
+
+        let wash = ink(0.03)
+        var regions: [FlatInstance] = []
+        if top > 0 { regions.append(FlatInstance(pos: SIMD2(0, 0), size: SIMD2(w, top), color: wash)) }
+        if bottom < h { regions.append(FlatInstance(pos: SIMD2(0, bottom), size: SIMD2(w, h - bottom), color: wash)) }
+        if left > 0 { regions.append(FlatInstance(pos: SIMD2(0, top), size: SIMD2(left, sideHeight), color: wash)) }
+        if right < w { regions.append(FlatInstance(pos: SIMD2(right, top), size: SIMD2(w - right, sideHeight), color: wash)) }
+
+        // Just outside the box, on each side that has room for it. The top and
+        // bottom rules run across the corners so the outline closes.
+        let line = max(1, layout.scale)
+        let edge = ink(0.22)
+        let hasLeft = left >= line, hasRight = right + line <= w
+        let ruleX = left - (hasLeft ? line : 0)
+        let ruleW = right + (hasRight ? line : 0) - ruleX
+        var edges: [FlatInstance] = []
+        if top >= line { edges.append(FlatInstance(pos: SIMD2(ruleX, top - line), size: SIMD2(ruleW, line), color: edge)) }
+        if bottom + line <= h { edges.append(FlatInstance(pos: SIMD2(ruleX, bottom), size: SIMD2(ruleW, line), color: edge)) }
+        if hasLeft { edges.append(FlatInstance(pos: SIMD2(left - line, top), size: SIMD2(line, sideHeight), color: edge)) }
+        if hasRight { edges.append(FlatInstance(pos: SIMD2(right, top), size: SIMD2(line, sideHeight), color: edge)) }
+
+        func draw(_ instances: [FlatInstance], with pipeline: MTLRenderPipelineState) {
+            var instances = instances
+            enc.setRenderPipelineState(pipeline)
+            enc.setVertexBytes(&instances, length: instances.count * MemoryLayout<FlatInstance>.stride, index: 0)
+            enc.setVertexBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 1)
+            enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4,
+                               instanceCount: instances.count)
+        }
+
+        draw(regions, with: flatPipeline)
+        if pattern != .plain {
+            let scale = layout.scale
+            var params = pattern == .stripes
+                ? SurroundParams(pattern: pattern.rawValue, period: 12 * scale, weight: 1 * scale)
+                : SurroundParams(pattern: pattern.rawValue, period: 10 * scale, weight: 1.25 * scale)
+            enc.setFragmentBytes(&params, length: MemoryLayout<SurroundParams>.stride, index: 0)
+            draw(regions.map { FlatInstance(pos: $0.pos, size: $0.size, color: ink(0.10)) },
+                 with: surroundPipeline)
+        }
+        if !edges.isEmpty { draw(edges, with: flatPipeline) }
+    }
+
     private func growBuffer<T>(_ buffer: inout MTLBuffer?,
                                capacity: inout Int,
                                count: Int,
@@ -481,6 +593,11 @@ package final class Renderer {
     /// (~0.35 ms measured) and is bound to the commit at the end of the run
     /// loop pass; the asynchronous one hands the drawable on as soon as the
     /// GPU is done with it.
+    ///
+    /// `gridOffset` moves the whole grid from its usual place at the top-left,
+    /// in drawable pixels — `GridLayout.centringOffset` for a held grid — and
+    /// `surround` fills whatever of the drawable the grid's box then leaves
+    /// over; see `encodeSurround`.
     package func render(to layer: CAMetalLayer,
                 snapshot: TerminalSnapshot,
                 selection: Selection?,
@@ -488,6 +605,8 @@ package final class Renderer {
                 focused: Bool,
                 cursorOn: Bool,
                 theme: Theme,
+                gridOffset: SIMD2<Float> = .zero,
+                surround: SurroundPattern? = nil,
                 transactional: Bool = false) {
         // Set before the drawable is taken — the mode belongs to the layer,
         // not the drawable — and only written when it changes.
@@ -498,6 +617,7 @@ package final class Renderer {
         let drawableSize = layer.drawableSize
 
         buildInstances(from: snapshot,
+                       origin: layout.origin + gridOffset,
                        selection: selection,
                        highlights: highlights,
                        focused: focused,
@@ -539,6 +659,12 @@ package final class Renderer {
                 vertexCount: 4,
                 instanceCount: flatScratch.count
             )
+        }
+
+        if let surround {
+            encodeSurround(surround, into: enc, cols: snapshot.cols, rows: snapshot.rows,
+                           at: gridOffset, drawableSize: drawableSize, theme: theme,
+                           uniforms: &uniforms)
         }
 
         // Glyph pass.

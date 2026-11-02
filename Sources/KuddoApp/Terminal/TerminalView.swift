@@ -76,9 +76,18 @@ final class TerminalView: NSView, CALayerDelegate {
         return view
     }()
     private var scrollIndicatorFade: DispatchWorkItem?
+    /// The icon, caption, details and button of a held session's surround;
+    /// built the first time one has any. See `layoutHoldBadge`.
+    private var holdBadge: HeldSizeBadgeView?
+    /// The badge shows a surround or a theme it hasn't been given yet.
+    private var holdBadgeStale = true
     private var lastScrollbackLines: Int = 0
     private var lastSnapshotCols: Int = 1
     private var lastSnapshotRows: Int = 1
+    /// How far the last frame moved the grid from the top-left, in drawable
+    /// pixels: zero, or the offset that centres a held grid. Clicks and the
+    /// held grid's box read it, so they land on the grid as drawn.
+    private var lastGridOffset: SIMD2<Float> = .zero
     private var lastReportedTitle: String = ""
     private var lastReportedCwd: String? = nil
     private var lastReportedFgProcess: String? = nil
@@ -230,6 +239,7 @@ final class TerminalView: NSView, CALayerDelegate {
         guard old != new else { return }
         invalidate()
         lastAppliedTheme = new
+        holdBadgeStale = true
         session?.applyThemeChange(from: old, to: new)
     }
 
@@ -288,6 +298,7 @@ final class TerminalView: NSView, CALayerDelegate {
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
         layoutScrollIndicator()
+        layoutHoldBadge()
         // The surface sized its drawable in its own setFrameSize, which AppKit
         // runs before laying us out, so the grid below reads the new size.
         resizeSessionIfNeeded()
@@ -1043,6 +1054,12 @@ final class TerminalView: NSView, CALayerDelegate {
            hit !== self, !hit.isDescendant(of: self) {
             return
         }
+        // The held-size badge's button: a control, so the arrow.
+        if let badge = holdBadge, !badge.isHidden, let p = lastMouseWindowPoint,
+           let hit = window?.contentView?.hitTest(p), hit.isDescendant(of: badge) {
+            NSCursor.arrow.set()
+            return
+        }
         if commandHeld,
            let match = hoveredTriggerMatch(),
            match.trigger.clickAction != nil {
@@ -1139,7 +1156,7 @@ final class TerminalView: NSView, CALayerDelegate {
         let cellWPts = CGFloat(renderer.layout.cellWidth) / scale
         let cellHPts = CGFloat(renderer.layout.cellHeight) / scale
         guard cellWPts > 0, cellHPts > 0 else { return (0, 0) }
-        let originPx = renderer.layout.origin
+        let originPx = renderer.layout.origin + lastGridOffset
         let originXPts = CGFloat(originPx.x) / scale
         let originYPts = CGFloat(originPx.y) / scale
         let col = Int(floor((point.x - originXPts) / cellWPts))
@@ -1232,12 +1249,14 @@ final class TerminalView: NSView, CALayerDelegate {
 
     /// Sizes and places the thumb, and tints it for the current theme.
     private func layoutScrollIndicator() {
-        guard let frame = ScrollIndicatorView.thumbFrame(in: bounds,
+        // Down the held grid's edge while there is one, not the window's.
+        let track = heldGridBox?.intersection(bounds) ?? bounds
+        guard let frame = ScrollIndicatorView.thumbFrame(in: CGRect(origin: .zero, size: track.size),
                                                         scrollOffset: scrollOffset,
                                                         scrollbackLines: lastScrollbackLines,
                                                         viewportRows: lastSnapshotRows)
         else { return }
-        scrollIndicator.frame = frame
+        scrollIndicator.frame = frame.offsetBy(dx: track.minX, dy: track.minY)
         let fg = lastAppliedTheme.foreground
         scrollIndicator.layer?.backgroundColor = NSColor(srgbRed: CGFloat(fg.x),
                                                          green: CGFloat(fg.y),
@@ -1591,6 +1610,9 @@ final class TerminalView: NSView, CALayerDelegate {
         s?.onOutput = { [weak self] in
             self?.sessionDidOutput()
         }
+        s?.onHoldChanged = { [weak self] in
+            self?.holdDidChange()
+        }
         s?.onChildExit = { [weak self] in
             guard let self else { return }
             self.delegate?.terminalViewDidTerminate(self)
@@ -1608,7 +1630,8 @@ final class TerminalView: NSView, CALayerDelegate {
     }
 
     private func resizeSessionIfNeeded() {
-        guard let session, let (cols, rows) = gridDimensions() else { return }
+        // Held at an external client's size, until it lets go and asks again.
+        guard let session, session.heldSize == nil, let (cols, rows) = gridDimensions() else { return }
         // The child hears about every grid change, mid-drag included, the way
         // Terminal.app does it. A full-screen app that re-renders on SIGWINCH
         // then keeps its own wrapping on screen throughout the drag instead of
@@ -1621,6 +1644,71 @@ final class TerminalView: NSView, CALayerDelegate {
         lastReportedGrid = (cols, rows)
         guard !first else { return }        // opening a tab isn't a resize
         delegate?.terminalView(self, didResizeGridTo: cols, rows: rows)
+    }
+
+    // MARK: a size held from outside
+
+    /// The session was held, held at another size or with another surround,
+    /// or let go. Let go, it takes the view's grid back.
+    private func holdDidChange() {
+        if session?.heldSize == nil { resizeSessionIfNeeded() }
+        holdBadgeStale = true
+        layoutHoldBadge()
+        if scrollIndicatorFade != nil { layoutScrollIndicator() }
+        invalidate()
+    }
+
+    /// While the session is held, the box its grid fills — the grid and its
+    /// margin all round, where a window exactly its size would end, centred
+    /// in the view — in this view's points, and nil otherwise. From the last
+    /// frame drawn, so it lines up with the pixels on screen rather than a
+    /// size still on its way.
+    private var heldGridBox: CGRect? {
+        guard session?.heldSize != nil, let layout = renderer?.layout else { return nil }
+        let scale = CGFloat(layout.scale)
+        let box = layout.boxSize(cols: lastSnapshotCols, rows: lastSnapshotRows)
+        return CGRect(x: CGFloat(lastGridOffset.x) / scale, y: CGFloat(lastGridOffset.y) / scale,
+                      width: CGFloat(box.x) / scale, height: CGFloat(box.y) / scale)
+    }
+
+    /// Puts the surround's badge in the space the held grid leaves, which the
+    /// renderer fills with its pattern; hides it otherwise.
+    private func layoutHoldBadge() {
+        guard let surround = session?.heldSurround, surround.hasBadge,
+              let box = heldGridBox else {
+            holdBadge?.isHidden = true
+            return
+        }
+        let badge: HeldSizeBadgeView
+        if let existing = holdBadge {
+            badge = existing
+        } else {
+            badge = HeldSizeBadgeView()
+            // Under the scroll indicator and the search bar.
+            addSubview(badge, positioned: .below, relativeTo: nil)
+            holdBadge = badge
+        }
+        if holdBadgeStale {
+            let fg = lastAppliedTheme.foreground
+            let bg = lastAppliedTheme.background
+            let luminance = 0.2126 * bg.x + 0.7152 * bg.y + 0.0722 * bg.z
+            badge.configure(surround,
+                            color: NSColor(srgbRed: CGFloat(fg.x), green: CGFloat(fg.y),
+                                           blue: CGFloat(fg.z), alpha: 0.5),
+                            dark: luminance < 0.5)
+            holdBadgeStale = false
+        }
+        // Under the grid, like a caption, when it fits there; beside it when
+        // the window is too short. The strips above and to the left mirror
+        // these two, so they'd never be picked.
+        var strips: [CGRect] = []
+        if box.maxY < bounds.maxY {
+            strips.append(CGRect(x: 0, y: box.maxY, width: bounds.width, height: bounds.maxY - box.maxY))
+        }
+        if box.maxX < bounds.maxX {
+            strips.append(CGRect(x: box.maxX, y: 0, width: bounds.maxX - box.maxX, height: bounds.height))
+        }
+        badge.place(in: strips)
     }
 
     @objc private func tick(_ sender: CADisplayLink) {
@@ -1689,6 +1777,11 @@ final class TerminalView: NSView, CALayerDelegate {
         lastScrollbackLines = snapshot.scrollbackLines
         lastSnapshotCols = snapshot.cols
         lastSnapshotRows = snapshot.rows
+        lastGridOffset = session?.heldSize == nil ? .zero
+            : renderer.layout.centringOffset(
+                cols: snapshot.cols, rows: snapshot.rows,
+                viewportPixels: SIMD2(Float(metalLayer.drawableSize.width),
+                                      Float(metalLayer.drawableSize.height)))
         lastScrolledRows = snapshot.scrolledRows
         if snapshot.usingAlt != lastUsingAlt {
             // Entering or leaving the alt buffer replaces the grid wholesale.
@@ -1707,6 +1800,7 @@ final class TerminalView: NSView, CALayerDelegate {
         // Gated on the fade so tabs that have never been scrolled don't build
         // the indicator at all.
         if scrollIndicatorFade != nil { layoutScrollIndicator() }
+        if session?.heldSize != nil || holdBadge?.isHidden == false { layoutHoldBadge() }
         let fgProcess = session?.foregroundProcess()?.name
         if snapshot.title != lastReportedTitle
             || snapshot.currentDirectory != lastReportedCwd
@@ -1740,6 +1834,8 @@ final class TerminalView: NSView, CALayerDelegate {
                         focused: focused,
                         cursorOn: cursorBlinkOn(),
                         theme: lastAppliedTheme,
+                        gridOffset: lastGridOffset,
+                        surround: session?.heldSurround?.pattern.rendered,
                         transactional: transactional || inLiveResize)
     }
 

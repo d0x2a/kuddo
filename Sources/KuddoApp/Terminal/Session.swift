@@ -492,6 +492,46 @@ package final class Session: TmuxCommandSink, TmuxPaneSink {
         }
     }
 
+    // MARK: a size held from outside
+
+    /// The size something other than this session's view holds it at — an
+    /// external client showing the tab, local or remote, which lays it out
+    /// for its own screen — or nil while the view sizes it, as it otherwise
+    /// always does. Main thread.
+    package private(set) var heldSize: (cols: Int, rows: Int)?
+
+    /// What the view draws around the grid while it is held, or nil for the
+    /// window's plain background. Main thread.
+    package private(set) var heldSurround: HeldSizeSurround?
+
+    /// Called on the main thread when the session is held, held differently
+    /// or let go, for the view to redraw around the grid — and, once it is
+    /// let go, to put its own grid back.
+    var onHoldChanged: (() -> Void)?
+
+    /// Sizes this session `cols` × `rows` and keeps it there, whatever its
+    /// view's size, until `releaseSize`, with `surround` filling the window
+    /// around it. Holding it again replaces both; at the size it already has,
+    /// only the surround changes, and nothing is resized. A tmux pane's size is
+    /// its window's, which tmux arranges, so one isn't held. Main thread.
+    package func holdSize(cols: Int, rows: Int,
+                          surround: HeldSizeSurround? = HeldSizeSurround()) {
+        guard pty != nil else { return }
+        let resized = heldSize.map { $0 != (cols, rows) } ?? true
+        heldSize = (cols, rows)
+        heldSurround = surround
+        if resized { resize(cols: cols, rows: rows) }
+        onHoldChanged?()
+    }
+
+    /// Lets the view size this session again. Main thread.
+    package func releaseSize() {
+        guard heldSize != nil else { return }
+        heldSize = nil
+        heldSurround = nil
+        onHoldChanged?()
+    }
+
     private func startReadLoop() {
         guard let pty else { return }
         let src = DispatchSource.makeReadSource(fileDescriptor: pty.masterFd, queue: queue)

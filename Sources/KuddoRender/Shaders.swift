@@ -104,5 +104,34 @@ package enum Shaders {
     fragment float4 flatFragment(VOutFlat in [[stage_in]]) {
         return in.color;
     }
+
+    // Must match Renderer.SurroundParams.
+    struct SurroundParams {
+        uint pattern;   // SurroundPattern's raw value: 1 stripes, 2 dots
+        float period;   // drawable pixels between one line or dot and the next
+        float weight;   // a line's width, or a dot's radius, in drawable pixels
+    };
+
+    // The pattern around a grid held smaller than its window, drawn over a
+    // flat quad in the quad's colour. Measured from the drawable's own pixels
+    // rather than the quad's, so it stays put while the window is resized.
+    fragment float4 surroundFragment(VOutFlat in [[stage_in]],
+                                     constant SurroundParams &params [[buffer(0)]]) {
+        float2 px = in.position.xy;
+        float coverage;
+        if (params.pattern == 1u) {
+            // 45° lines on x + y = k·period, measured across the line.
+            float s = (px.x + px.y) / params.period;
+            float across = abs(s - round(s)) * params.period * 0.70710678;
+            coverage = clamp(params.weight * 0.5 + 0.5 - across, 0.0, 1.0);
+        } else {
+            // Dots, every other row shifted half a step.
+            float row = floor(px.y / params.period);
+            float2 q = float2(px.x + fmod(row, 2.0) * params.period * 0.5, px.y);
+            float2 centre = (floor(q / params.period) + 0.5) * params.period;
+            coverage = clamp(params.weight + 0.5 - length(q - centre), 0.0, 1.0);
+        }
+        return float4(in.color.rgb, in.color.a * coverage);
+    }
     """
 }
