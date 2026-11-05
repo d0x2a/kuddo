@@ -1,14 +1,112 @@
 import KuddoCore
 import AppKit
 
-protocol SidebarDelegate: AnyObject {
-    func sidebarDidSelect(tabId: UUID)
-    func sidebarDidRequestClose(tabId: UUID)
+/// What the sidebar and the top strip tell the window about its tabs.
+protocol TabListDelegate: AnyObject {
+    func tabListDidSelect(tabId: UUID)
+    func tabListDidRequestClose(tabId: UUID)
     /// `toIndex` is the gap index in the pre-move array — i.e. 0 means
-    /// "above the first row," N means "below the last row," k for 0<k<N
-    /// means "between row k-1 and row k." Callers do their own
+    /// "before the first tab," N means "after the last," k for 0<k<N
+    /// means "between tab k-1 and tab k." Callers do their own
     /// remove-then-insert with the appropriate offset adjustment.
-    func sidebarDidReorderTab(tabId: UUID, toIndex: Int)
+    func tabListDidReorderTab(tabId: UUID, toIndex: Int)
+}
+
+/// One tab as the sidebar and the top strip show it. `process` and
+/// `directory` make the sidebar's line under the title and the strip's
+/// tooltip, the directory already in display form (`~`-folded); a sidebar
+/// row with neither centres its title alone.
+struct TabEntry {
+    enum Status { case working, waiting }
+
+    var id: UUID
+    var title: String
+    var directory: String?
+    /// The foreground command, by process name; nil at a shell prompt.
+    var process: String?
+    /// What the marker ahead of the title shows; nil shows nothing.
+    var status: Status?
+}
+
+/// What the sidebar and the top strip have in common to look at.
+enum TabListStyle {
+    /// Tints the panel so it reads as distinct from the terminal beside it:
+    /// a light theme's goes slightly darker than its background, while a
+    /// dark theme's goes slightly lighter (pushing a dark bg further toward
+    /// black just muddies it). The shift is small on purpose.
+    static func panelColor() -> NSColor {
+        let theme = ThemeStore.currentTheme
+        let bg = theme.background
+        // Blend toward black (light themes) or white (dark themes) by a small
+        // amount so the panel separates without looking like a different color.
+        let amount: Float = 0.06
+        let target: Float = theme.appearance == .dark ? 1.0 : 0.0
+        func mix(_ c: Float) -> CGFloat { CGFloat(c + (target - c) * amount) }
+        return NSColor(
+            srgbRed: mix(bg.x), green: mix(bg.y), blue: mix(bg.z),
+            alpha: CGFloat(bg.w))
+    }
+
+    /// The line between a panel and the terminal. The system separator reads
+    /// as too bright over a dark terminal, so it comes from the theme
+    /// background: nearly blended on a dark theme, a little stronger on a
+    /// light one so it stays perceptible.
+    static func separatorColor() -> NSColor {
+        let theme = ThemeStore.currentTheme
+        let bg = theme.background
+        let isDark = theme.appearance == .dark
+        let amount: Float = isDark ? 0.05 : 0.06
+        let target: Float = isDark ? 1.0 : 0.0
+        func mix(_ c: Float) -> CGFloat { CGFloat(c + (target - c) * amount) }
+        return NSColor(srgbRed: mix(bg.x), green: mix(bg.y), blue: mix(bg.z),
+                       alpha: CGFloat(bg.w))
+    }
+
+    /// ⌘1–8 address the first eight tabs; ⌘9 always jumps to the last one.
+    static func badge(at idx: Int, of count: Int) -> String? {
+        shortcutDigit(at: idx, of: count).map { "⌘\($0)" }
+    }
+
+    /// The digit that goes with ⌘ to reach the tab at `idx`, if one does.
+    static func shortcutDigit(at idx: Int, of count: Int) -> String? {
+        if idx < 8 { return "\(idx + 1)" }
+        if idx == count - 1 { return "9" }
+        return nil
+    }
+
+    /// The marker ahead of a tab's title. Orange for a tab that wants you,
+    /// the way the ⌘K hub marks one that rang. Working is quieter on purpose
+    /// — it asks nothing — and static: a spinner per busy tab would keep the
+    /// main thread drawing for as long as any agent worked.
+    static func statusMark(_ status: TabEntry.Status) -> (image: NSImage?, tint: NSColor) {
+        let symbol: String
+        let tint: NSColor
+        let label: String
+        switch status {
+        case .waiting: (symbol, tint, label) = ("circle.fill", .systemOrange, "Waiting for you")
+        case .working: (symbol, tint, label) = ("circle.dotted", .secondaryLabelColor, "Working")
+        }
+        let image = NSImage(systemSymbolName: symbol, accessibilityDescription: label)?
+            .withSymbolConfiguration(statusConfiguration)
+        return (image, tint)
+    }
+
+    /// The marker with its colour baked in, for a menu item, which won't tint
+    /// an image the way an image view does. A tab without one gets a blank of
+    /// the same size, so every title in the menu starts at the same x.
+    static func statusMenuImage(_ status: TabEntry.Status?) -> NSImage? {
+        guard let status else {
+            let size = statusMark(.waiting).image?.size ?? NSSize(width: 9, height: 9)
+            return NSImage(size: size)
+        }
+        let tint = statusMark(status).tint
+        // Applied over the size, not in place of it: a configuration given
+        // on its own replaces the one before, size included.
+        return statusMark(status).image?.withSymbolConfiguration(
+            statusConfiguration.applying(NSImage.SymbolConfiguration(paletteColors: [tint])))
+    }
+
+    private static let statusConfiguration = NSImage.SymbolConfiguration(pointSize: 8, weight: .bold)
 }
 
 extension NSPasteboard.PasteboardType {
@@ -17,15 +115,16 @@ extension NSPasteboard.PasteboardType {
 
 /// Layout constants shared between the row views and the drop-indicator math.
 private enum SidebarMetrics {
-    static let rowHeight: CGFloat = 26
+    /// Two lines: the tab's title over its working directory.
+    static let rowHeight: CGFloat = 40
     static let topInset: CGFloat = 4
 }
 
 final class SidebarView: NSView {
-    weak var delegate: SidebarDelegate?
+    weak var delegate: TabListDelegate?
 
     private let scrollView = NSScrollView()
-    private let document = SidebarDocumentView()
+    private let document = TabDropView()
     private let stack = NSStackView()
     private var rows: [TabRowView] = []
     private let dropIndicator = NSView()
@@ -95,25 +194,12 @@ final class SidebarView: NSView {
 
     @objc private func themeDidChange() { applyThemeBackground() }
 
-    /// Tints the sidebar so it reads as a distinct panel beside the terminal:
-    /// a light theme's sidebar goes slightly darker than its background, while
-    /// a dark theme's goes slightly lighter (pushing a dark bg further toward
-    /// black just muddies it). The shift is small on purpose.
+    /// See `TabListStyle.panelColor`.
     private func applyThemeBackground() {
-        let theme = ThemeStore.currentTheme
-        let bg = theme.background
-        // Blend toward black (light themes) or white (dark themes) by a small
-        // amount so the panel separates without looking like a different color.
-        let amount: Float = 0.06
-        let target: Float = theme.appearance == .dark ? 1.0 : 0.0
-        func mix(_ c: Float) -> CGFloat { CGFloat(c + (target - c) * amount) }
-        let color = NSColor(
-            srgbRed: mix(bg.x), green: mix(bg.y), blue: mix(bg.z),
-            alpha: CGFloat(bg.w))
-        layer?.backgroundColor = color.cgColor
+        layer?.backgroundColor = TabListStyle.panelColor().cgColor
     }
 
-    func update(tabs: [(id: UUID, title: String)], activeId: UUID?) {
+    func update(tabs: [TabEntry], activeId: UUID?) {
         // Only rebuild when the tabs themselves change. Titles change on every
         // prompt and refreshSidebar() runs for each one — tearing down the row
         // under the pointer would cancel the press AppKit is tracking, losing
@@ -123,19 +209,19 @@ final class SidebarView: NSView {
             rebuildRows(for: tabs)
         }
         for (idx, tab) in tabs.enumerated() {
-            rows[idx].apply(title: tab.title,
+            rows[idx].apply(tab,
                             isActive: tab.id == activeId,
-                            badge: badge(at: idx, of: tabs.count))
+                            badge: TabListStyle.badge(at: idx, of: tabs.count))
         }
     }
 
-    private func rebuildRows(for tabs: [(id: UUID, title: String)]) {
+    private func rebuildRows(for tabs: [TabEntry]) {
         rows.forEach { $0.removeFromSuperview() }
         rows.removeAll(keepingCapacity: true)
         for tab in tabs {
             let row = TabRowView(id: tab.id)
-            row.onSelect = { [weak self] in self?.delegate?.sidebarDidSelect(tabId: tab.id) }
-            row.onClose  = { [weak self] in self?.delegate?.sidebarDidRequestClose(tabId: tab.id) }
+            row.onSelect = { [weak self] in self?.delegate?.tabListDidSelect(tabId: tab.id) }
+            row.onClose  = { [weak self] in self?.delegate?.tabListDidRequestClose(tabId: tab.id) }
             row.translatesAutoresizingMaskIntoConstraints = false
             stack.addArrangedSubview(row)
             row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
@@ -143,13 +229,6 @@ final class SidebarView: NSView {
         }
         // Keep the indicator above the new rows.
         document.addSubview(dropIndicator)
-    }
-
-    /// ⌘1–8 address the first eight tabs; ⌘9 always jumps to the last one.
-    private func badge(at idx: Int, of count: Int) -> String? {
-        if idx < 8 { return "⌘\(idx + 1)" }
-        if idx == count - 1 { return "⌘9" }
-        return nil
     }
 
     // MARK: drop logic
@@ -170,7 +249,7 @@ final class SidebarView: NSView {
         let index = targetIndex(for: point.y)
         guard let str = info.draggingPasteboard.string(forType: .kuddoTab),
               let uuid = UUID(uuidString: str) else { return false }
-        delegate?.sidebarDidReorderTab(tabId: uuid, toIndex: index)
+        delegate?.tabListDidReorderTab(tabId: uuid, toIndex: index)
         return true
     }
 
@@ -195,10 +274,10 @@ final class SidebarView: NSView {
     }
 }
 
-/// Flipped document view that also serves as the drag-and-drop destination.
-/// Forwards drag callbacks to SidebarView via closures so the destination
-/// logic can live next to the row layout it controls.
-private final class SidebarDocumentView: NSView {
+/// Flipped document view that also serves as the drag-and-drop destination,
+/// for the sidebar and the top strip both. Forwards drag callbacks via
+/// closures so the destination logic can live next to the layout it controls.
+final class TabDropView: NSView {
     override var isFlipped: Bool { true }
 
     /// Returns whether the drop is acceptable at this point. `nil` means
@@ -229,12 +308,19 @@ private final class SidebarDocumentView: NSView {
     }
 }
 
-final class TabRowView: NSView, NSDraggingSource {
+/// A tab in the sidebar or the top strip. Selects on press, drags to
+/// reorder, swaps its ⌘-number for a close button on hover, and carries the
+/// status marker. Subclasses place the parts; `label` they add themselves,
+/// since the sidebar stacks it over a second line and the strip doesn't.
+class TabItemView: NSView, NSDraggingSource {
     let id: UUID
-    private let highlight = NSView()
-    private let label = NSTextField(labelWithString: "")
-    private let badgeLabel = NSTextField(labelWithString: "")
-    private let closeBtn = NSButton()
+    let highlight = NSView()
+    let label = NSTextField(labelWithString: "")
+    /// Ahead of the title: working, waiting on you, or nothing.
+    let statusMark = NSImageView()
+    let badgeLabel = NSTextField(labelWithString: "")
+    let closeBtn = NSButton()
+    private var status: TabEntry.Status?
     private var isActive = false
     private var badgeText: String?
     private var hover = false { didSet { refreshAppearance() } }
@@ -268,12 +354,16 @@ final class TabRowView: NSView, NSDraggingSource {
         label.maximumNumberOfLines = 1
         label.usesSingleLineMode = true
         label.translatesAutoresizingMaskIntoConstraints = false
-        // The title is the only thing in the row that may shrink: a long one
-        // must truncate rather than push the badge past the trailing edge.
+        // The title is the only thing that may shrink: a long one must
+        // truncate rather than push the badge past the trailing edge.
         label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
+        statusMark.imageScaling = .scaleNone
+        statusMark.translatesAutoresizingMaskIntoConstraints = false
+        statusMark.isHidden = true
+
         // Secondary, not tertiary: at a quarter opacity the shortcut was too
-        // faint to read against the tinted sidebar.
+        // faint to read against the tinted panel.
         badgeLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
         badgeLabel.textColor = .secondaryLabelColor
         badgeLabel.alignment = .right
@@ -292,30 +382,9 @@ final class TabRowView: NSView, NSDraggingSource {
         closeBtn.isHidden = true     // hover-only
         closeBtn.translatesAutoresizingMaskIntoConstraints = false
 
-        addSubview(label)
+        addSubview(statusMark)
         addSubview(badgeLabel)
         addSubview(closeBtn)
-
-        NSLayoutConstraint.activate([
-            highlight.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 5),
-            highlight.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -5),
-            highlight.topAnchor.constraint(equalTo: topAnchor, constant: 1),
-            highlight.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -1),
-
-            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
-            label.centerYAnchor.constraint(equalTo: centerYAnchor),
-            label.trailingAnchor.constraint(lessThanOrEqualTo: badgeLabel.leadingAnchor, constant: -6),
-
-            badgeLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
-            badgeLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
-
-            closeBtn.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
-            closeBtn.centerYAnchor.constraint(equalTo: centerYAnchor),
-
-            heightAnchor.constraint(equalToConstant: SidebarMetrics.rowHeight),
-        ])
-
-        refreshAppearance()
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
@@ -368,12 +437,12 @@ final class TabRowView: NSView, NSDraggingSource {
         item.setString(id.uuidString, forType: .kuddoTab)
 
         let dragItem = NSDraggingItem(pasteboardWriter: item)
-        dragItem.setDraggingFrame(bounds, contents: rowSnapshot())
+        dragItem.setDraggingFrame(bounds, contents: snapshot())
 
         beginDraggingSession(with: [dragItem], event: event, source: self)
     }
 
-    private func rowSnapshot() -> NSImage {
+    private func snapshot() -> NSImage {
         let rep = bitmapImageRepForCachingDisplay(in: bounds)!
         cacheDisplay(in: bounds, to: rep)
         let img = NSImage(size: bounds.size)
@@ -388,8 +457,8 @@ final class TabRowView: NSView, NSDraggingSource {
         .move
     }
 
-    /// Dim the source row while a drag is in flight so the drop indicator
-    /// reads clearly even when it overlaps neighboring slots.
+    /// Dim the source while a drag is in flight so the drop indicator reads
+    /// clearly even when it overlaps neighboring slots.
     func draggingSession(_ session: NSDraggingSession,
                          willBeginAt screenPoint: NSPoint) {
         alphaValue = 0.3
@@ -403,15 +472,32 @@ final class TabRowView: NSView, NSDraggingSource {
 
     // MARK: appearance
 
-    /// Updates the row in place. Rows outlive a sidebar refresh so that a
-    /// press in flight isn't cancelled by an unrelated title change.
-    func apply(title: String, isActive: Bool, badge: String?) {
+    /// Updates the tab in place. Views outlive a refresh so that a press in
+    /// flight isn't cancelled by an unrelated title change.
+    func apply(_ entry: TabEntry, isActive: Bool, badge: String?) {
         let badgeString = badge ?? ""
-        if label.stringValue != title { label.stringValue = title }
+        if label.stringValue != entry.title { label.stringValue = entry.title }
         if badgeLabel.stringValue != badgeString { badgeLabel.stringValue = badgeString }
+        if status != entry.status {
+            status = entry.status
+            applyStatus()
+        }
         self.isActive = isActive
         self.badgeText = badge
         refreshAppearance()
+    }
+
+    /// See `TabListStyle.statusMark`.
+    private func applyStatus() {
+        guard let status else {
+            statusMark.isHidden = true
+            statusMark.image = nil
+            return
+        }
+        let mark = TabListStyle.statusMark(status)
+        statusMark.image = mark.image
+        statusMark.contentTintColor = mark.tint
+        statusMark.isHidden = false
     }
 
     private func refreshAppearance() {
@@ -433,4 +519,101 @@ final class TabRowView: NSView, NSDraggingSource {
     }
 
     @objc private func closeAction(_ sender: Any)  { onClose?() }
+}
+
+/// A tab's row in the sidebar: its title over the foreground process and the
+/// directory.
+final class TabRowView: TabItemView {
+    private let processLabel = NSTextField(labelWithString: "")
+    private let directoryLabel = NSTextField(labelWithString: "")
+    /// The line under the title: the foreground process, then the directory.
+    private let detail = NSStackView()
+    /// Title over detail. Hidden views drop out of a stack's layout, so a row
+    /// with nothing to put under its title centres the title alone.
+    private let lines = NSStackView()
+
+    override init(id: UUID) {
+        super.init(id: id)
+
+        // Truncated at the head, not the middle like the title: the end of a
+        // path is where you are, while its start is nearly always `~/source/`
+        // or the like, which tells one tab from another not at all.
+        directoryLabel.font = NSFont.systemFont(ofSize: 11)
+        directoryLabel.textColor = .secondaryLabelColor
+        directoryLabel.lineBreakMode = .byTruncatingHead
+        directoryLabel.maximumNumberOfLines = 1
+        directoryLabel.usesSingleLineMode = true
+        directoryLabel.isHidden = true
+        directoryLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        // The process name never truncates — "cla…" names nothing — so a long
+        // path gives way to it. Heavier than the path so the two read as two
+        // things without a separator between them.
+        processLabel.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
+        processLabel.textColor = .secondaryLabelColor
+        processLabel.maximumNumberOfLines = 1
+        processLabel.usesSingleLineMode = true
+        processLabel.isHidden = true
+        processLabel.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
+        processLabel.setContentHuggingPriority(.required, for: .horizontal)
+
+        detail.orientation = .horizontal
+        detail.alignment = .firstBaseline
+        detail.spacing = 5
+        detail.detachesHiddenViews = true
+        detail.addArrangedSubview(processLabel)
+        detail.addArrangedSubview(directoryLabel)
+        detail.isHidden = true
+        detail.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        lines.orientation = .vertical
+        lines.alignment = .leading
+        lines.spacing = 1
+        lines.detachesHiddenViews = true
+        lines.translatesAutoresizingMaskIntoConstraints = false
+        lines.addArrangedSubview(label)
+        lines.addArrangedSubview(detail)
+        lines.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        addSubview(lines)
+
+        NSLayoutConstraint.activate([
+            highlight.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 5),
+            highlight.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -5),
+            highlight.topAnchor.constraint(equalTo: topAnchor, constant: 1),
+            highlight.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -1),
+
+            // A gutter the marker sits in, kept on rows without one so every
+            // title starts at the same x.
+            statusMark.centerXAnchor.constraint(equalTo: leadingAnchor, constant: 15),
+            statusMark.centerYAnchor.constraint(equalTo: label.centerYAnchor),
+            lines.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 24),
+            lines.centerYAnchor.constraint(equalTo: centerYAnchor),
+            lines.trailingAnchor.constraint(lessThanOrEqualTo: badgeLabel.leadingAnchor, constant: -6),
+
+            badgeLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            badgeLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+
+            closeBtn.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            closeBtn.centerYAnchor.constraint(equalTo: centerYAnchor),
+
+            heightAnchor.constraint(equalToConstant: SidebarMetrics.rowHeight),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    override func apply(_ entry: TabEntry, isActive: Bool, badge: String?) {
+        setText(entry.process, of: processLabel)
+        setText(entry.directory, of: directoryLabel)
+        let hasDetail = !processLabel.isHidden || !directoryLabel.isHidden
+        if detail.isHidden == hasDetail { detail.isHidden = !hasDetail }
+        super.apply(entry, isActive: isActive, badge: badge)
+    }
+
+    private func setText(_ text: String?, of field: NSTextField) {
+        let string = text ?? ""
+        guard field.stringValue != string else { return }
+        field.stringValue = string
+        field.isHidden = string.isEmpty
+    }
 }

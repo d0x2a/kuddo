@@ -27,8 +27,9 @@ int kuddo_spawn(const char *path,
 // Updates the PTY's window size via TIOCSWINSZ. Returns 0 on success.
 int kuddo_set_winsize(int fd, unsigned short rows, unsigned short cols);
 
-// Writes the executable name of `pid` into `buf` (NUL-terminated), up to
-// `len` bytes. Returns the number of bytes written (excluding the NUL), or
+// Writes the name `pid` was started by into `buf` (NUL-terminated), up to
+// `len` bytes: argv[0]'s last component, or the executable's name when argv
+// can't be read. Returns the number of bytes written (excluding the NUL), or
 // 0 if the lookup failed (process exited, permission denied, etc).
 int kuddo_proc_name(pid_t pid, char *buf, int len);
 

@@ -36,6 +36,13 @@ package final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        // Kuddo's tabs are its sidebar. Left on, AppKit's window tabbing puts
+        // "Show Tab Bar" (⇧⌘T) and "Merge All Windows" in the menus, and its
+        // tab bar — one tab per window, all named after the window — reads as
+        // the sidebar turned sideways. It goes before the menu is installed,
+        // which is when AppKit adds those items.
+        NSWindow.allowsAutomaticWindowTabbing = false
+
         let mainMenu = MainMenu.build()
 
         #if DEBUG

@@ -331,6 +331,11 @@ package final class TerminalState: ParserSink {
     private(set) var cursorVisible: Bool = true
     private(set) var title: String = ""
     package private(set) var currentDirectory: String? = nil
+    /// `title` for the app, which reads it outside a snapshot for a tab in the
+    /// background. A wrapper, not `package` on the stored var: whole-module
+    /// optimisation drops the exclusivity checks only on storage nothing
+    /// outside the module can reach.
+    package var windowTitle: String { title }
 
     /// A full-screen erase is the first half of a repaint, and an app that
     /// wraps the repaint in a synchronized update doesn't always wrap the

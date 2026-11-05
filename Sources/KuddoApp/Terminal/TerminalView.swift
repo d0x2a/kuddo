@@ -1094,6 +1094,14 @@ final class TerminalView: NSView, CALayerDelegate {
     /// 120 Hz.
     private func sessionDidOutput() {
         needsFrame = true
+        // In the background: no surface to draw on, so no frame, and the frame
+        // is where the title, cwd and process get read. The sidebar shows all
+        // three for every tab — an agent finishing in a tab you aren't looking
+        // at is the case that matters — so read them here instead.
+        guard surface != nil else {
+            scheduleBackgroundReport()
+            return
+        }
         guard CACurrentMediaTime() - lastPresentTime >= frameInterval else { return }
         // Honour the synchronized-update gate here too: "output" is just as
         // likely to be the first half of a frame the child hasn't finished
@@ -1107,6 +1115,43 @@ final class TerminalView: NSView, CALayerDelegate {
         if frame.synchronizedUpdateActive { return }
         renderFrame(using: frame.snapshot)
     }
+
+    /// Tells the delegate when the title, cwd or foreground process changed
+    /// since it last heard. The process is asked for here rather than passed
+    /// in; `Pty` caches the answer, so a frame doesn't cost a sysctl.
+    private func reportIfChanged(title: String, cwd: String?) {
+        let fgProcess = session?.foregroundProcess()?.name
+        guard title != lastReportedTitle
+            || cwd != lastReportedCwd
+            || fgProcess != lastReportedFgProcess else { return }
+        lastReportedTitle = title
+        lastReportedCwd = cwd
+        lastReportedFgProcess = fgProcess
+        delegate?.terminalView(self, didUpdate: title, cwd: cwd,
+                               foregroundProcess: fgProcess)
+    }
+
+    /// A background tab's report, a moment after its output rather than on
+    /// every chunk of it: an agent working in the background streams output
+    /// the whole time, and its title only says something new when it stops.
+    /// Reading the state when the delay runs out, not when it was scheduled,
+    /// makes the last change of a burst the one reported.
+    private func scheduleBackgroundReport() {
+        guard backgroundReport == nil else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.backgroundReport = nil
+            guard let session = self.session else { return }
+            let (title, cwd) = session.titleAndDirectory
+            self.reportIfChanged(title: title, cwd: cwd)
+        }
+        backgroundReport = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.backgroundReportDelay,
+                                      execute: work)
+    }
+
+    private var backgroundReport: DispatchWorkItem?
+    private static let backgroundReportDelay: TimeInterval = 0.25
 
     /// The frame to present next, or nil without a session. Keeping position,
     /// a scrolled-back viewport is measured from the last frame and the
@@ -1809,18 +1854,7 @@ final class TerminalView: NSView, CALayerDelegate {
         // the indicator at all.
         if scrollIndicatorFade != nil { layoutScrollIndicator() }
         if session?.heldSize != nil || holdBadge?.isHidden == false { layoutHoldBadge() }
-        let fgProcess = session?.foregroundProcess()?.name
-        if snapshot.title != lastReportedTitle
-            || snapshot.currentDirectory != lastReportedCwd
-            || fgProcess != lastReportedFgProcess {
-            lastReportedTitle = snapshot.title
-            lastReportedCwd = snapshot.currentDirectory
-            lastReportedFgProcess = fgProcess
-            delegate?.terminalView(self,
-                                   didUpdate: snapshot.title,
-                                   cwd: snapshot.currentDirectory,
-                                   foregroundProcess: fgProcess)
-        }
+        reportIfChanged(title: snapshot.title, cwd: snapshot.currentDirectory)
         // Trigger matches are only ever read while ⌘ is held — ⌘-click, the
         // pointing-hand affordance and the hover marking all gate on it — so
         // evaluating on every frame spent a fraction of a millisecond of the

@@ -362,6 +362,12 @@ package final class Session: TmuxCommandSink, TmuxPaneSink {
         queue.sync { state.currentDirectory }
     }
 
+    /// The OSC title and cwd in one trip to the parser queue, for a tab that
+    /// isn't rendering and so has no snapshot to read them from.
+    var titleAndDirectory: (title: String, cwd: String?) {
+        queue.sync { (state.windowTitle, state.currentDirectory) }
+    }
+
     /// See Pty.foregroundProcess(). Called from the main thread on close.
     func foregroundProcess() -> (pid: pid_t, name: String)? {
         // A tmux-backed tab has no child of its own to ask about. What runs in

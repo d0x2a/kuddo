@@ -217,23 +217,58 @@ final class Pty {
             return (cached.pid, cached.name)
         }
 
-        // The group leader is often only a wrapper — `codex` is an npm shim
-        // whose leader is `node` — so name the command it actually started.
-        let fg = kuddo_foreground_pid(pgid)
-        var buf = [CChar](repeating: 0, count: 256)
-        let n = buf.withUnsafeMutableBufferPointer { ptr in
-            kuddo_proc_name(fg, ptr.baseAddress, Int32(ptr.count))
-        }
+        // The group leader is the command that was typed, and is the answer
+        // unless it only launched the real one — `codex` is an npm shim whose
+        // leader is `node` — and then the deepest process in the group is.
+        // Deepest always was wrong for a program with helpers of its own:
+        // Claude Code starts `caffeinate` while it works, which put
+        // "caffeinate" where "claude" belonged.
+        let leaderName = Self.processName(of: pgid)
+        let fg: pid_t
         let name: String
-        if n > 0, let s = String(validatingUTF8: buf), !s.isEmpty {
-            name = s
+        if let leaderName, !Self.isLauncher(leaderName) {
+            (fg, name) = (pgid, leaderName)
         } else {
+            fg = kuddo_foreground_pid(pgid)
             // Lookup failed but the pgid is real — still report the process.
-            name = "a process"
+            name = Self.processName(of: fg) ?? leaderName ?? "a process"
         }
         cachedForeground = (pgid, fg, name, now)
         return (fg, name)
     }
+
+    private static func processName(of pid: pid_t) -> String? {
+        var buf = [CChar](repeating: 0, count: 256)
+        let n = buf.withUnsafeMutableBufferPointer { ptr in
+            kuddo_proc_name(pid, ptr.baseAddress, Int32(ptr.count))
+        }
+        guard n > 0, let s = String(validatingUTF8: buf), !s.isEmpty else { return nil }
+        return s
+    }
+
+    /// Whether a process by this name is there to run another program rather
+    /// than to be one: an interpreter running a script (an npm package's bin
+    /// is `node`, a shell script is `bash`), or a command that runs the
+    /// command after it. Versions come off first — "python3.12", and the
+    /// framework build's "Python", are both "python".
+    static func isLauncher(_ name: String) -> Bool {
+        var base = name.lowercased()
+        while let last = base.last, last.isNumber || last == "." || last == "-" {
+            base.removeLast()
+        }
+        return launchers.contains(base)
+    }
+
+    private static let launchers: Set<String> = [
+        // Interpreters and runtimes
+        "node", "bun", "deno", "python", "ruby", "perl", "php", "java", "lua",
+        // Shells, when the job is a script
+        "sh", "bash", "zsh", "dash", "ksh", "fish", "tcsh",
+        // Package runners
+        "npm", "npx", "pnpm", "yarn", "uv", "uvx", "pipx",
+        // Commands that run the command after them
+        "env", "sudo", "nice", "nohup", "time", "timeout", "caffeinate", "arch", "xcrun",
+    ]
 }
 
 /// Waits on the shells Kuddo starts. A child that exits stays in the process

@@ -14,8 +14,29 @@ package enum AppearanceMode: String, Codable, CaseIterable, Identifiable {
     }
 }
 
+/// Where a window lists its tabs.
+package enum TabPlacement: String, Codable, CaseIterable, Identifiable {
+    /// A column down the left, two lines a tab.
+    case sidebar
+    /// A strip under the title bar, one line a tab.
+    case top
+    /// Nowhere: ⌘1–9, ⌃Tab and the ⌘K hub still switch tabs.
+    case hidden
+
+    package var id: String { rawValue }
+
+    package var displayName: String {
+        switch self {
+        case .sidebar: return "Sidebar"
+        case .top:     return "Top"
+        case .hidden:  return "Hidden"
+        }
+    }
+}
+
 package struct AppSettings: Codable, Equatable {
     package var appearanceMode: AppearanceMode = .system
+    package var tabPlacement: TabPlacement = .sidebar
     package var lightThemeId: String = Theme.kuddoLight.id
     package var darkThemeId: String = Theme.kuddoDark.id
     package var fontFamily: String = FontCatalog.defaultFamily
@@ -100,7 +121,7 @@ package struct AppSettings: Codable, Equatable {
     package var defaultProfileId: String? = nil
 
     private enum CodingKeys: String, CodingKey {
-        case appearanceMode, lightThemeId, darkThemeId, fontFamily, fontSize,
+        case appearanceMode, tabPlacement, lightThemeId, darkThemeId, fontFamily, fontSize,
              strokeWeight, lineHeight, blinkCursor, displaySync,
              warnOnCloseWithRunningProcess,
              confirmClearScreen,
@@ -114,6 +135,7 @@ package struct AppSettings: Codable, Equatable {
     package func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(appearanceMode, forKey: .appearanceMode)
+        try c.encode(tabPlacement, forKey: .tabPlacement)
         try c.encode(lightThemeId, forKey: .lightThemeId)
         try c.encode(darkThemeId, forKey: .darkThemeId)
         try c.encode(fontFamily, forKey: .fontFamily)
@@ -139,6 +161,10 @@ package struct AppSettings: Codable, Equatable {
     package init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.appearanceMode = try c.decodeIfPresent(AppearanceMode.self, forKey: .appearanceMode) ?? .system
+        // `try?`: a placement this version doesn't know — written by a later
+        // one — falls back to the sidebar rather than failing the whole file.
+        self.tabPlacement = (try? c.decodeIfPresent(TabPlacement.self, forKey: .tabPlacement))
+            .flatMap { $0 } ?? .sidebar
         self.lightThemeId   = try c.decodeIfPresent(String.self, forKey: .lightThemeId)
                                   .map(Theme.renamedId) ?? Theme.kuddoLight.id
         self.darkThemeId    = try c.decodeIfPresent(String.self, forKey: .darkThemeId)

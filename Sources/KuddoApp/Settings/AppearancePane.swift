@@ -37,6 +37,24 @@ struct AppearancePane: View {
                 }
             }
 
+            Section("Tabs") {
+                Picker("Show tabs", selection: $store.settings.tabPlacement) {
+                    ForEach(TabPlacement.allCases) { placement in
+                        Text(placement.displayName).tag(placement)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .focusableControl(.tabPlacement, focus: $focus) { direction in
+                    stepSelection(&store.settings.tabPlacement,
+                                  in: TabPlacement.allCases, by: direction)
+                }
+                if store.settings.tabPlacement == .hidden {
+                    Text("⌘1–9, ⌃Tab and the ⌘K hub still switch tabs.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
             Section("Theme") {
                 Picker("Light theme",
                        selection: $store.settings.lightThemeId) {

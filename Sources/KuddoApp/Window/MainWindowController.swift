@@ -1,5 +1,6 @@
 import KuddoCore
 import AppKit
+import Combine
 
 /// An attention event raised by the child process inside a terminal.
 enum TerminalAttention {
@@ -22,7 +23,7 @@ protocol TerminalViewDelegate: AnyObject {
 }
 
 final class MainWindowController: NSWindowController, NSWindowDelegate,
-                                  SidebarDelegate, TerminalViewDelegate,
+                                  TabListDelegate, TerminalViewDelegate,
                                   TmuxControllerHost, SessionTransport {
     /// NSWindowController.window is `unowned(unsafe)` — without our own strong
     /// reference the window would deallocate before NSApp.windows can grab it.
@@ -36,6 +37,16 @@ final class MainWindowController: NSWindowController, NSWindowDelegate,
     }
 
     private let sidebar = SidebarView()
+    /// The tabs along the top, for `TabPlacement.top`. Always in the view
+    /// tree, at zero height when the tabs are elsewhere.
+    private let tabStrip = TabStripView()
+    private var tabStripHeight: NSLayoutConstraint!
+    /// At the right of the title bar: a menu of the tabs, whichever way
+    /// they are shown.
+    private let tabMenuButton = TabMenuButton()
+    /// Where this window lists its tabs: the setting, applied.
+    private var tabPlacement: TabPlacement = .sidebar
+    private var tabPlacementObserver: AnyCancellable?
 /// One Metal surface and one Renderer for the whole window; the active
     /// tab's view is pinned inside it. See TerminalSurface — a layer per tab
     /// cost a drawable pool per tab, forever.
@@ -71,6 +82,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate,
             defer: false
         )
         window.title = "Kuddo"
+        // Never a system tab bar, whatever was saved while one was allowed or
+        // the system's "Prefer tabs" says. See `allowsAutomaticWindowTabbing`
+        // in AppDelegate.
+        window.tabbingMode = .disallowed
         window.minSize = NSSize(width: 600, height: 320)
         window.center()
         self.retainedWindow = window
@@ -81,6 +96,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate,
         // led to surprising behavior when the user double-clicked to zoom.
 
         sidebar.delegate = self
+        tabStrip.delegate = self
         TabDirectory.shared.register(self)
 
         let sidebarVC = NSViewController()
@@ -91,18 +107,56 @@ final class MainWindowController: NSWindowController, NSWindowDelegate,
         sidebarItem.minimumThickness = 140
         sidebarItem.maximumThickness = 320
         sidebarItem.preferredThicknessFraction = 0.18
-        sidebarItem.canCollapse = true
+        // A drag stops at the minimum rather than collapsing the sidebar: the
+        // divider goes with a collapsed one, so nothing on screen could bring
+        // it back. Putting the tabs elsewhere is the "Show tabs" setting's job.
+        sidebarItem.canCollapse = false
         sidebarItem.holdingPriority = .defaultLow + 1
 
-        let contentVC = NSViewController()
-        contentVC.view = contentContainer
+        // The terminal, with the top strip over it.
+        let contentColumn = NSView()
+        contentColumn.translatesAutoresizingMaskIntoConstraints = false
+        tabStrip.translatesAutoresizingMaskIntoConstraints = false
         contentContainer.translatesAutoresizingMaskIntoConstraints = false
+        contentColumn.addSubview(tabStrip)
+        contentColumn.addSubview(contentContainer)
+        tabStripHeight = tabStrip.heightAnchor.constraint(equalToConstant: 0)
+        NSLayoutConstraint.activate([
+            tabStrip.leadingAnchor.constraint(equalTo: contentColumn.leadingAnchor),
+            tabStrip.trailingAnchor.constraint(equalTo: contentColumn.trailingAnchor),
+            tabStrip.topAnchor.constraint(equalTo: contentColumn.topAnchor),
+            tabStripHeight,
+            contentContainer.leadingAnchor.constraint(equalTo: contentColumn.leadingAnchor),
+            contentContainer.trailingAnchor.constraint(equalTo: contentColumn.trailingAnchor),
+            contentContainer.topAnchor.constraint(equalTo: tabStrip.bottomAnchor),
+            contentContainer.bottomAnchor.constraint(equalTo: contentColumn.bottomAnchor),
+        ])
+        let contentVC = NSViewController()
+        contentVC.view = contentColumn
         let contentItem = NSSplitViewItem(viewController: contentVC)
 
         splitVC.splitView = ThemedSplitView()
         splitVC.splitViewItems = [sidebarItem, contentItem]
         splitVC.splitView.autosaveName = "Kuddo.Sidebar"
         window.contentViewController = splitVC
+        // Loading the split view restores what was saved, collapsed included —
+        // `canCollapse` doesn't stop that — so a sidebar dragged shut by an
+        // earlier version would come back shut, for good.
+        sidebarItem.isCollapsed = false
+
+        let tabMenuAccessory = NSTitlebarAccessoryViewController()
+        tabMenuAccessory.view = tabMenuButton
+        tabMenuAccessory.layoutAttribute = .trailing
+        window.addTitlebarAccessoryViewController(tabMenuAccessory)
+        tabMenuButton.makeMenu = { [weak self] in self?.tabMenu() ?? NSMenu() }
+
+        applyTabPlacement(ThemeStore.shared.settings.tabPlacement)
+        // Live: every open window follows the setting as it changes.
+        tabPlacementObserver = ThemeStore.shared.$settings
+            .map(\.tabPlacement)
+            .removeDuplicates()
+            .dropFirst()
+            .sink { [weak self] in self?.applyTabPlacement($0) }
 
         gridHUD.translatesAutoresizingMaskIntoConstraints = false
         gridHUD.isHidden = true
@@ -167,7 +221,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate,
         // Looking at the tab is the acknowledgement; the marker has done its job.
         tabs.first { $0.id == id }?.wantsAttention = false
         installActiveTerminalView()
-        refreshSidebar()
+        refreshTabList()
         if let tab = tabs.first(where: { $0.id == id }) {
             window?.title = displayWindowTitle(for: tab)
         }
@@ -212,7 +266,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate,
             let nextIdx = min(idx, tabs.count - 1)
             selectTab(tabs[nextIdx].id)
         } else {
-            refreshSidebar()
+            refreshTabList()
         }
     }
 
@@ -377,11 +431,84 @@ final class MainWindowController: NSWindowController, NSWindowDelegate,
         window?.makeFirstResponder(v)
     }
 
-    private func refreshSidebar() {
-        sidebar.update(
-            tabs: tabs.map { ($0.id, $0.displayTitle) },
-            activeId: activeTabId
-        )
+    /// Brings whichever list shows the tabs up to date. Only that one: this
+    /// runs on every title change, and a hidden list catches up when it is
+    /// shown (`applyTabPlacement`).
+    private func refreshTabList() {
+        tabMenuButton.showsAttention = tabs.contains(where: \.wantsAttention)
+        switch tabPlacement {
+        case .sidebar: sidebar.update(tabs: tabs.map(tabEntry), activeId: activeTabId)
+        case .top:     tabStrip.update(tabs: tabs.map(tabEntry), activeId: activeTabId)
+        case .hidden:  break
+        }
+    }
+
+    /// Collapsing is how the sidebar goes: it keeps its width for when it
+    /// comes back, where taking it out of the split view would lose it.
+    private func applyTabPlacement(_ placement: TabPlacement) {
+        tabPlacement = placement
+        splitVC.splitViewItems.first?.isCollapsed = placement != .sidebar
+        tabStrip.isHidden = placement != .top
+        tabStripHeight.constant = placement == .top ? TabStripView.height : 0
+        // The divider's grab zone comes and goes with the sidebar.
+        window?.invalidateCursorRects(for: splitVC.splitView)
+        refreshTabList()
+    }
+
+    /// The title bar button's menu: the tabs in order, the current one
+    /// checked, each with its marker, its ⌘ shortcut and, under the title,
+    /// the process and directory the sidebar shows.
+    private func tabMenu() -> NSMenu {
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        for (idx, tab) in tabs.enumerated() {
+            let entry = tabEntry(for: tab)
+            let item = NSMenuItem(title: entry.title.isEmpty ? "Untitled" : entry.title,
+                                  action: #selector(selectTabFromMenu(_:)),
+                                  keyEquivalent: TabListStyle.shortcutDigit(at: idx, of: tabs.count) ?? "")
+            item.keyEquivalentModifierMask = .command
+            item.target = self
+            item.representedObject = tab.id
+            item.state = tab.id == activeTabId ? .on : .off
+            item.image = TabListStyle.statusMenuImage(entry.status)
+            if #available(macOS 14.4, *) {
+                let detail = [entry.process, entry.directory].compactMap { $0 }
+                    .joined(separator: "  ")
+                if !detail.isEmpty { item.subtitle = detail }
+            }
+            menu.addItem(item)
+        }
+        return menu
+    }
+
+    @objc private func selectTabFromMenu(_ item: NSMenuItem) {
+        guard let id = item.representedObject as? UUID else { return }
+        selectTab(id)
+    }
+
+    private func tabEntry(for tab: Tab) -> TabEntry {
+        // The row's own marker says what the agent's mark did, so the mark
+        // comes off the title — where Claude Code's flipped between two
+        // glyphs every second it worked. A symbol that isn't an agent's mark
+        // stays: then it is part of the name.
+        let title = tab.agentStatus == nil ? tab.displayTitle : tab.notificationName
+        // Orange only until the tab is looked at: an agent idle at its prompt
+        // is waiting too, but one you've seen there needs no reminding, and a
+        // marker on every idle agent is one nobody reads. `wantsAttention` is
+        // that unseen request, from an agent stopping or a bell alike.
+        let status: TabEntry.Status?
+        if tab.wantsAttention {
+            status = .waiting
+        } else if tab.agentStatus == .working {
+            status = .working
+        } else {
+            status = nil
+        }
+        return TabEntry(id: tab.id,
+                        title: title,
+                        directory: tab.currentDirectory.map(Tab.homeFolded),
+                        process: tab.foregroundProcess,
+                        status: status)
     }
 
     // MARK: title helpers
@@ -391,36 +518,30 @@ final class MainWindowController: NSWindowController, NSWindowDelegate,
         guard let cwd = tab.terminalView.currentDirectory, !cwd.isEmpty else {
             return caption
         }
-        let path = foldHome(cwd)
+        let path = Tab.homeFolded(cwd)
         // Don't repeat the caption when it's just the directory name (the common
         // idle-shell case, e.g. "~/source/Kuddo — Kuddo").
         if caption.isEmpty || caption == Tab.basename(of: cwd) { return path }
         return "\(path) — \(caption)"
     }
 
-    private func foldHome(_ cwd: String) -> String {
-        let home = NSHomeDirectory()
-        if cwd == home { return "~" }
-        if cwd.hasPrefix(home + "/") { return "~" + cwd.dropFirst(home.count) }
-        return cwd
-    }
+    // MARK: TabListDelegate
 
-    // MARK: SidebarDelegate
+    func tabListDidSelect(tabId: UUID)       { selectTab(tabId) }
+    func tabListDidRequestClose(tabId: UUID) { closeTab(tabId) }
 
-    func sidebarDidSelect(tabId: UUID)      { selectTab(tabId) }
-    func sidebarDidRequestClose(tabId: UUID) { closeTab(tabId) }
-
-    /// SidebarView reports `toIndex` as a gap index in the pre-move array.
+    /// The sidebar and the strip report `toIndex` as a gap index in the
+    /// pre-move array.
     /// We remove the dragged tab first and then insert at the target gap,
     /// adjusting by -1 when the gap was to the right of the original slot
     /// (the removal shifted later indices down by one).
-    func sidebarDidReorderTab(tabId: UUID, toIndex: Int) {
+    func tabListDidReorderTab(tabId: UUID, toIndex: Int) {
         guard let from = tabs.firstIndex(where: { $0.id == tabId }) else { return }
         let tab = tabs.remove(at: from)
         let insertAt = toIndex > from ? toIndex - 1 : toIndex
         let clamped = max(0, min(tabs.count, insertAt))
         tabs.insert(tab, at: clamped)
-        refreshSidebar()
+        refreshTabList()
     }
 
     // MARK: TerminalViewDelegate
@@ -435,10 +556,31 @@ final class MainWindowController: NSWindowController, NSWindowDelegate,
             // Idle shell: prefer the local cwd, fall back to OSC title or default.
             newDisplay = Tab.basename(of: cwd) ?? (title.isEmpty ? "Kuddo" : title)
         }
-        if newDisplay != tab.displayTitle {
-            tab.displayTitle = newDisplay
-            refreshSidebar()
+        if newDisplay != tab.displayTitle { tab.displayTitle = newDisplay }
+        tab.foregroundProcess = foregroundProcess
+        // Only while a program runs, as for the title: an agent's last title
+        // can outlive it when nothing at the prompt sets another.
+        let agentStatus = foregroundProcess == nil ? nil : Tab.agentStatus(ofTitle: title)
+        if agentStatus != tab.agentStatus {
+            switch agentStatus {
+            case .waiting where !isTabFrontmost(tab):
+                // It stopped to wait on you somewhere you weren't looking.
+                tab.wantsAttention = true
+            case .working:
+                // Answered from elsewhere — tmux, a second head — or it went
+                // on by itself. Either way it no longer wants you.
+                tab.wantsAttention = false
+            default:
+                break
+            }
+            tab.agentStatus = agentStatus
         }
+        // Refreshed whatever the title did: the row also shows the cwd and the
+        // process, and either can change under an unchanged title — `cd`
+        // between two directories of the same name, say. Cheap: the view only
+        // calls here when the title, cwd or foreground process changed, and
+        // rows are updated in place, never rebuilt, for it.
+        refreshTabList()
         if activeTabId == tab.id {
             window?.title = displayWindowTitle(for: tab)
         }
@@ -477,10 +619,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate,
     func terminalView(_ view: TerminalView, didRequestAttention attention: TerminalAttention) {
         guard let tab = tabs.first(where: { $0.terminalView === view }) else { return }
 
-        // Marks the tab for the ⌘K hub, ahead of every notification opt-out
-        // below: the row marker is the in-app trace of the same event, and a
-        // user who turned banners off still wants to find the tab that rang.
-        if !isTabFrontmost(tab) { tab.wantsAttention = true }
+        // Marks the tab in the sidebar and the ⌘K hub, ahead of every
+        // notification opt-out below: the row marker is the in-app trace of
+        // the same event, and a user who turned banners off still wants to
+        // find the tab that rang.
+        if !isTabFrontmost(tab), !tab.wantsAttention {
+            tab.wantsAttention = true
+            refreshTabList()
+        }
 
         // A program that sends a notification escape may ring the bell in the
         // same breath — omp does both when it asks a question — and that would
@@ -554,6 +700,15 @@ final class MainWindowController: NSWindowController, NSWindowDelegate,
 
     // MARK: NSWindowDelegate
 
+    /// Coming back to the window is looking at the tab it shows, so that tab's
+    /// marker has done its job the way selecting it would have.
+    func windowDidBecomeKey(_ notification: Notification) {
+        guard let tab = tabs.first(where: { $0.id == activeTabId }),
+              tab.wantsAttention else { return }
+        tab.wantsAttention = false
+        refreshTabList()
+    }
+
     func windowWillClose(_ notification: Notification) {
         TabDirectory.shared.unregister(self)
         // Settings isn't a document window — with the last terminal gone there
@@ -619,7 +774,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate,
     func tmuxSetTabTitle(windowID: String, title: String) {
         guard let tab = tabs.first(where: { $0.tmuxWindowID == windowID }) else { return }
         tab.displayTitle = title
-        refreshSidebar()
+        refreshTabList()
         if activeTabId == tab.id { window?.title = displayWindowTitle(for: tab) }
     }
 
@@ -822,8 +977,12 @@ private final class ThemedSplitView: NSSplitView {
                       width: dividerThickness, height: bounds.height)
     }
 
-    /// The widened interaction zone centered on the drawn divider.
+    /// The widened interaction zone centered on the drawn divider. None while
+    /// the sidebar is collapsed: AppKit hides the divider then but leaves the
+    /// hidden sidebar its old frame, so a zone worked out from that would sit
+    /// in the middle of the terminal and take its clicks.
     private var grabRect: NSRect {
+        if arrangedSubviews.first?.isHidden ?? true { return .zero }
         let d = dividerRect
         return NSRect(x: d.midX - Self.grabMargin, y: 0,
                       width: Self.grabMargin * 2, height: bounds.height)
@@ -843,7 +1002,8 @@ private final class ThemedSplitView: NSSplitView {
     /// the 1pt drawn line.
     override func resetCursorRects() {
         super.resetCursorRects()
-        addCursorRect(grabRect, cursor: .resizeLeftRight)
+        let grab = grabRect
+        if !grab.isEmpty { addCursorRect(grab, cursor: .resizeLeftRight) }
     }
 
     override func drawDivider(in rect: NSRect) {
@@ -851,16 +1011,5 @@ private final class ThemedSplitView: NSSplitView {
         rect.fill()
     }
 
-    private var themedDividerColor: NSColor {
-        let theme = ThemeStore.currentTheme
-        let bg = theme.background
-        // Dark themes blend almost fully into the background; light themes get
-        // a slightly stronger line so the divider stays perceptible.
-        let isDark = theme.appearance == .dark
-        let amount: Float = isDark ? 0.05 : 0.06
-        let target: Float = isDark ? 1.0 : 0.0
-        func mix(_ c: Float) -> CGFloat { CGFloat(c + (target - c) * amount) }
-        return NSColor(srgbRed: mix(bg.x), green: mix(bg.y), blue: mix(bg.z),
-                       alpha: CGFloat(bg.w))
-    }
+    private var themedDividerColor: NSColor { TabListStyle.separatorColor() }
 }

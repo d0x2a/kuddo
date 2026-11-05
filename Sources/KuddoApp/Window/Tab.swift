@@ -17,10 +17,12 @@ package final class Tab {
     /// opened with ⌘T follows the user's later change of default rather than
     /// pinning itself to whatever was default when it opened.
     let profileId: UUID?
-    /// Raised when the child rang the bell or posted an OSC notification while
-    /// this tab wasn't the one being looked at, and cleared when it is selected.
-    /// Only the ⌘K hub reads it today — it is what puts the bell marker on a
-    /// row — but it is the state the sidebar would need for the same badge.
+    /// Raised when the child rang the bell or posted an OSC notification, or a
+    /// coding agent in it stopped to wait on you, while this tab wasn't the
+    /// one being looked at. Cleared when it is looked at — selected, or its
+    /// window brought back to the front — or when the agent gets back to work.
+    /// It puts the bell marker on the tab's ⌘K hub row, and the waiting
+    /// marker on its sidebar row.
     var wantsAttention: Bool = false
     /// A bell's banner, held back briefly in case a notification escape that
     /// says more comes with it (`MainWindowController.bellGrace`).
@@ -54,12 +56,30 @@ package final class Tab {
         if let name = Self.basename(of: v.initialCwd) { displayTitle = name }
     }
 
+    /// Where the tab's shell is: the cwd it last reported over OSC 7 or, until
+    /// it has, the directory it opens in, so a tab restored in the background
+    /// shows a path before it is first selected. A tmux window has no opening
+    /// directory of ours (`initialCwd` is just the home-dir default there), so
+    /// it shows one only once its pane reports it.
+    var currentDirectory: String? {
+        if let cwd = terminalView.currentDirectory, !cwd.isEmpty { return cwd }
+        return tmuxWindowID == nil ? terminalView.initialCwd : nil
+    }
+
     /// How a directory names a tab: its last component, `~` for home.
     static func basename(of cwd: String?) -> String? {
         guard let cwd, !cwd.isEmpty else { return nil }
         if cwd == "/" { return "/" }
         if cwd == NSHomeDirectory() { return "~" }
         return (cwd as NSString).lastPathComponent
+    }
+
+    /// A directory as the user would type it: the home prefix folded to `~`.
+    static func homeFolded(_ cwd: String) -> String {
+        let home = NSHomeDirectory()
+        if cwd == home { return "~" }
+        if cwd.hasPrefix(home + "/") { return "~" + cwd.dropFirst(home.count) }
+        return cwd
     }
 
     /// The tab's name at the head of a notification banner. Coding agents put
@@ -74,22 +94,65 @@ package final class Tab {
     var notificationName: String { Self.notificationName(of: displayTitle) }
 
     static func notificationName(of title: String) -> String {
+        splitStatusMark(title).name
+    }
+
+    /// A title's leading agent status mark, if it has one, and the name after
+    /// it. `mark` is the scalars that make the mark — "✳", or "π >" for omp —
+    /// without the space that follows. See `notificationName`.
+    static func splitStatusMark(_ title: String) -> (mark: [Unicode.Scalar]?, name: String) {
         let s = Array(title.unicodeScalars)
-        let start: Int
+        let markLength: Int
         if s.count > 4, s[0] == "π", s[1] == " ", s[3] == " ",
            !s[2].properties.isAlphabetic, !s[2].properties.isWhitespace,
            s[2].properties.numericType == nil {
-            start = 4
+            markLength = 3
         } else if s.count > 2, s[1] == " ",
                   s[0].properties.generalCategory == .otherSymbol || s[0] == "·",
                   !s[0].properties.isEmojiPresentation {
-            start = 2
+            markLength = 1
         } else {
-            return title
+            return (nil, title)
         }
         var rest = String.UnicodeScalarView()
-        rest.append(contentsOf: s[start...])
+        rest.append(contentsOf: s[(markLength + 1)...])
         let name = String(rest).trimmingCharacters(in: .whitespaces)
-        return name.isEmpty ? title : name
+        return name.isEmpty ? (nil, title) : (Array(s[..<markLength]), name)
     }
+
+    /// What a coding agent in the tab is doing, by the mark its title leads
+    /// with. nil when no agent we know of is speaking, or its mark says
+    /// nothing we can read.
+    var agentStatus: AgentStatus?
+
+    enum AgentStatus: Equatable {
+        /// Thinking or running tools: leave it be.
+        case working
+        /// Its turn is over or it is asking something: it needs you.
+        case waiting
+    }
+
+    /// - Claude Code (2.1.318): "✳" while it waits on you, a permission
+    ///   prompt included; "◐" and "◑" in turn, about once a second, while it
+    ///   works. Earlier versions animated a braille frame instead.
+    /// - omp: "π >" idle, "π !" waiting on you, "π :" or a spinner frame
+    ///   working.
+    ///
+    /// Only the marks an agent is known to use count. Any other symbol a
+    /// title happens to lead with is somebody's name for something.
+    static func agentStatus(ofTitle title: String) -> AgentStatus? {
+        guard let mark = splitStatusMark(title).mark else { return nil }
+        if mark.count == 3 {                                  // omp: "π ? "
+            return mark[2] == ">" || mark[2] == "!" ? .waiting : .working
+        }
+        switch mark[0].value {
+        case 0x2733: return .waiting                          // ✳
+        case 0x25D0, 0x25D1, 0x2800...0x28FF: return .working // ◐ ◑, braille
+        default: return nil
+        }
+    }
+
+    /// The command running in the foreground, by process name — "claude",
+    /// "omp", "vim". nil while the shell itself is at its prompt.
+    var foregroundProcess: String?
 }

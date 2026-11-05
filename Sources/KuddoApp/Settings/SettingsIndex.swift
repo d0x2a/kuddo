@@ -63,6 +63,8 @@ enum SettingsIndex {
         // Appearance
         .init(.mode, .appearance, "Mode",
               "light dark system theme appearance follow auto"),
+        .init(.tabPlacement, .appearance, "Show tabs",
+              "tab bar sidebar top hide hidden horizontal vertical strip layout"),
         .init(.lightTheme, .appearance, "Light theme",
               "colours colors palette scheme solarized nord dracula gruvbox"),
         .init(.darkTheme, .appearance, "Dark theme",

@@ -7,7 +7,7 @@ enum SettingsField: Hashable {
     /// Settings opens — so ↑/↓ change section until Tab moves into the pane.
     case sidebar
     // Appearance
-    case mode, lightTheme, darkTheme, importTheme
+    case mode, tabPlacement, lightTheme, darkTheme, importTheme
     case fontFamily, fontSize, strokeWeight, lineHeight, blinkCursor, displaySync
     // Profiles
     case profileList, profileAdd, profileRemove, profileMoveUp, profileMoveDown

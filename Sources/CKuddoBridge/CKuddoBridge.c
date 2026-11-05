@@ -70,9 +70,52 @@ int kuddo_set_winsize(int fd, unsigned short rows, unsigned short cols) {
     return ioctl(fd, TIOCSWINSZ, &ws);
 }
 
+// argv[0]'s last path component, without a login shell's leading '-'.
+// KERN_PROCARGS2 is argc, then the exec path, NUL padding, then argv.
+static int argv0_name(pid_t pid, char *buf, int len) {
+    int mib[3] = { CTL_KERN, KERN_ARGMAX, 0 };
+    int argmax = 0;
+    size_t size = sizeof(argmax);
+    if (sysctl(mib, 2, &argmax, &size, NULL, 0) != 0 || argmax <= 0) return 0;
+
+    char *args = malloc((size_t)argmax);
+    if (!args) return 0;
+    mib[1] = KERN_PROCARGS2;
+    mib[2] = (int)pid;
+    size = (size_t)argmax;
+    int n = 0;
+    if (sysctl(mib, 3, args, &size, NULL, 0) == 0 && size > sizeof(int)) {
+        char *end = args + size;
+        char *p = args + sizeof(int);
+        while (p < end && *p) p++;              // exec path
+        while (p < end && !*p) p++;             // padding
+        char *arg0 = p;
+        while (p < end && *p) p++;
+        if (arg0 < end && p < end && p > arg0) {
+            char *base = strrchr(arg0, '/');
+            base = base ? base + 1 : arg0;
+            if (*base == '-') base++;
+            size_t blen = strlen(base);
+            if (blen > 0) {
+                if ((int)blen >= len) blen = (size_t)len - 1;
+                memcpy(buf, base, blen);
+                buf[blen] = '\0';
+                n = (int)blen;
+            }
+        }
+    }
+    free(args);
+    return n;
+}
+
 int kuddo_proc_name(pid_t pid, char *buf, int len) {
     if (!buf || len <= 0) return 0;
     buf[0] = '\0';
+    // The name it was started by first: the kernel's own name for a process
+    // is its executable's after symlinks resolve, and Claude Code's
+    // `~/.local/bin/claude` resolves to `versions/2.1.318` — "2.1.318".
+    int a = argv0_name(pid, buf, len);
+    if (a > 0) return a;
     int n = proc_name(pid, buf, (uint32_t)len);
     if (n <= 0) {
         buf[0] = '\0';
