@@ -1009,7 +1009,14 @@ final class TerminalView: NSView, CALayerDelegate {
         lastMouseCoord = nil
         lastMouseWindowPoint = nil
         commandHeld = false
-        updateCursorAffordance()
+        // The I-beam stops at the terminal's edge. Left set, it rode along
+        // into the title bar and the tab strip, which set no cursor of their
+        // own. The divider's grab zone is the one neighbour with another.
+        if window?.contentView?.hitTest(event.locationInWindow) is NSSplitView {
+            NSCursor.resizeLeftRight.set()
+        } else {
+            NSCursor.arrow.set()
+        }
     }
 
     override func flagsChanged(with event: NSEvent) {
@@ -1035,11 +1042,16 @@ final class TerminalView: NSView, CALayerDelegate {
     }
 
     private func updateCursorAffordance() {
+        // Not over the terminal — `mouseExited` clears the point — so the
+        // cursor is whatever is under the pointer's to set. `flagsChanged`
+        // still lands here, the terminal being first responder wherever the
+        // pointer is, and without this a ⌘ press over the title bar put the
+        // I-beam there.
+        guard let p = lastMouseWindowPoint else { return }
         // When the pointer sits over the split-view divider's enlarged grab
         // zone (which overlaps our left edge), let that resize cursor stand
         // instead of forcing the I-beam over it.
-        if let p = lastMouseWindowPoint,
-           window?.contentView?.hitTest(p) is NSSplitView {
+        if window?.contentView?.hitTest(p) is NSSplitView {
             NSCursor.resizeLeftRight.set()
             return
         }
@@ -1049,13 +1061,12 @@ final class TerminalView: NSView, CALayerDelegate {
         // I-beam would be stamped over the hub every time the mouse twitched,
         // beating whatever cursor that view asked for. Bail and let it set its
         // own; ours is restored on the next move back over the terminal.
-        if let p = lastMouseWindowPoint,
-           let hit = window?.contentView?.hitTest(p),
+        if let hit = window?.contentView?.hitTest(p),
            hit !== self, !hit.isDescendant(of: self) {
             return
         }
         // The held-size badge's button: a control, so the arrow.
-        if let badge = holdBadge, !badge.isHidden, let p = lastMouseWindowPoint,
+        if let badge = holdBadge, !badge.isHidden,
            let hit = window?.contentView?.hitTest(p), hit.isDescendant(of: badge) {
             NSCursor.arrow.set()
             return
