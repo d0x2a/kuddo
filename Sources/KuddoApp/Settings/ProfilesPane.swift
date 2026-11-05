@@ -17,13 +17,6 @@ struct ProfilesPane: View {
     @FocusState.Binding var focus: SettingsField?
 
     @State private var selection: UUID?
-    /// The selected profile's environment, as ordered rows.
-    ///
-    /// `Profile.environment` is a dictionary, which has no order to edit in
-    /// and no identity to bind a text field to — a row being typed into would
-    /// jump as soon as its key sorted differently. These rows hold that order
-    /// and identity; `commitEnvironment` folds them back into the dictionary.
-    @State private var envRows: [EnvRow] = []
 
     init(focus: FocusState<SettingsField?>.Binding) {
         self._focus = focus
@@ -57,9 +50,7 @@ struct ProfilesPane: View {
         .formStyle(.grouped)
         .onAppear {
             if selection == nil { selection = store.profiles.first?.id }
-            loadEnvironment()
         }
-        .onChange(of: selection) { _, _ in loadEnvironment() }
     }
 
     // MARK: list
@@ -169,31 +160,15 @@ struct ProfilesPane: View {
         }
 
         Section("Environment") {
-            if envRows.isEmpty {
-                Text("No extra variables. The child inherits Kuddo's environment.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            ForEach($envRows) { $row in
-                HStack(spacing: 6) {
-                    TextField("NAME", text: $row.key)
-                        .frame(width: 150)
-                        .onChange(of: row.key) { _, _ in commitEnvironment() }
-                    Text("=").foregroundStyle(.secondary)
-                    TextField("value", text: $row.value)
-                        .onChange(of: row.value) { _, _ in commitEnvironment() }
-                    Button { removeEnvRow(row.id) } label: { Image(systemName: "minus.circle") }
-                        .buttonStyle(.borderless)
-                }
-            }
-            HStack {
-                Spacer()
-                Button("Add Variable") {
-                    envRows.append(EnvRow(key: "", value: ""))
-                }
-                .focusableControl(.profileEnvAdd, focus: $focus,
-                                  onActivate: { envRows.append(EnvRow(key: "", value: "")) })
-            }
+            EnvironmentEditor(saved: profile.environment,
+                              emptyNote: "No extra variables. The child inherits Kuddo's "
+                                  + "environment and the variables from Settings › Environment.",
+                              anchor: .profileEnvAdd,
+                              focus: $focus,
+                              save: { saveEnvironment($0, to: profile.id) })
+                // A fresh editor per profile: one left open on another
+                // profile is dropped, never saved into this one.
+                .id(profile.id)
         }
 
         Section {
@@ -321,37 +296,10 @@ struct ProfilesPane: View {
 
     // MARK: environment
 
-    private func loadEnvironment() {
-        let env = selected?.environment ?? [:]
-        envRows = env.keys.sorted().map { EnvRow(key: $0, value: env[$0]!) }
-    }
-
-    private func removeEnvRow(_ id: UUID) {
-        envRows.removeAll { $0.id == id }
-        commitEnvironment()
-    }
-
-    /// Folds the rows back into the profile. A row with an empty name is kept
-    /// on screen but left out of the profile — that's a row being typed, not
-    /// a variable named "".
-    private func commitEnvironment() {
-        guard var p = selected else { return }
-        var env: [String: String] = [:]
-        for row in envRows {
-            let key = row.key.trimmingCharacters(in: .whitespaces)
-            guard !key.isEmpty else { continue }
-            env[key] = row.value
-        }
-        guard env != p.environment else { return }
+    private func saveEnvironment(_ env: [String: String], to id: UUID) {
+        guard var p = store.profiles.first(where: { $0.id == id }),
+              env != p.environment else { return }
         p.environment = env
         store.update(p)
     }
-}
-
-/// One editable environment variable. Identity is the row's, not the key's, so
-/// renaming a variable doesn't destroy the field being typed into.
-private struct EnvRow: Identifiable, Equatable {
-    let id = UUID()
-    var key: String
-    var value: String
 }

@@ -188,7 +188,18 @@ private final class SettingsHostingController: NSHostingController<SettingsView>
 /// NSWindow subclass that closes on Esc (and ⌘.) via the responder chain's
 /// `cancelOperation(_:)` hook.
 private final class SettingsWindow: NSWindow {
+    /// Not out from under an edit, though. With an editor open
+    /// (`SettingsEdits`), Esc is its Cancel. In any other field being typed
+    /// in, Esc ends the typing — a text field passes Esc up the chain rather
+    /// than using it, so without this, Esc mid-word took the window away.
+    /// The sidebar's search field is left alone — Esc there is about the
+    /// search, and it handles that itself.
     override func cancelOperation(_ sender: Any?) {
+        let typing = (firstResponder as? NSTextView).map {
+            $0.isEditable && !($0.delegate is NSSearchField)
+        } ?? false
+        if typing { makeFirstResponder(nil) }
+        if SettingsEdits.cancelOpen() || typing { return }
         performClose(sender)
     }
 }

@@ -46,9 +46,10 @@ final class Pty {
     /// spawn, so a profile running bash gets bash's hooks while the zsh tab
     /// next to it keeps its own — nothing about either leaks into the app's
     /// environment or into the other tab.
-    static func spawn(_ spec: LaunchSpec, cols: Int, rows: Int) -> Pty? {
-        var argv = spec.argv
-        var env = [
+    /// What Kuddo itself sets in every tab, as "KEY=VALUE". Settings lists
+    /// the names, so this is the one place they are written down.
+    static var kuddoEnvironment: [String] {
+        [
             "TERM=xterm-256color",
             "COLORTERM=truecolor",
             "TERM_PROGRAM=Kuddo",
@@ -67,14 +68,31 @@ final class Pty {
             // version Kuddo understands.
             "WARP_CLI_AGENT_PROTOCOL_VERSION=1",
         ]
+    }
+
+    /// Everything Kuddo itself puts in a tab's environment, on top of the one
+    /// it was started with: `kuddoEnvironment`, and a LANG if it had none.
+    /// Settings › Environment lists these from here, so the list can't drift
+    /// from what a tab gets.
+    static var baseEnvironment: [String] {
+        var env = kuddoEnvironment
         if ProcessInfo.processInfo.environment["LANG"] == nil {
             env.append("LANG=en_US.UTF-8")
         }
+        return env
+    }
+
+    static func spawn(_ spec: LaunchSpec, cols: Int, rows: Int) -> Pty? {
+        var argv = spec.argv
+        var env = baseEnvironment
         if let injection = ShellIntegration.injection(path: spec.path, argv: argv) {
             argv = injection.argv
             env += injection.env
         }
-        // The profile's own variables last, so they win over ours.
+        // Then the variables from Settings › Environment, for every tab, and the
+        // profile's own last: each wins over everything before it.
+        let shared = ThemeStore.shared.settings.environment
+        env += shared.keys.sorted().map { "\($0)=\(shared[$0]!)" }
         env += spec.env
 
         var pid: pid_t = 0

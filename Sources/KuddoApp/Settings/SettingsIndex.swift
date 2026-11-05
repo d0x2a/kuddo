@@ -2,7 +2,7 @@ import Foundation
 
 /// The panes, in sidebar order.
 enum SettingsCategory: String, CaseIterable, Identifiable {
-    case appearance, profiles, triggers, general, notifications
+    case appearance, profiles, environment, triggers, general, notifications
 
     var id: String { rawValue }
 
@@ -10,6 +10,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable {
         switch self {
         case .appearance:    return "Appearance"
         case .profiles:      return "Profiles"
+        case .environment:   return "Environment"
         case .triggers:      return "Triggers"
         case .general:       return "General"
         case .notifications: return "Notifications"
@@ -20,6 +21,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable {
         switch self {
         case .appearance:    return "paintbrush"
         case .profiles:      return "person.crop.rectangle.stack"
+        case .environment:   return "list.bullet.rectangle"
         case .triggers:      return "bolt.horizontal"
         case .general:       return "gearshape"
         case .notifications: return "bell"
@@ -101,6 +103,10 @@ enum SettingsIndex {
         .init(.profileEnvAdd, .profiles, "Environment variables",
               "env var export path setenv"),
 
+        // Environment
+        .init(.tabEnvAdd, .environment, "Environment variables for every tab",
+              "env var export path setenv new tab all profiles global term colorterm term_program lang locale force_hyperlink warp predefined default built-in"),
+
         // Triggers
         .init(.triggerList, .triggers, "Triggers",
               "list rules regex highlight links"),
@@ -137,7 +143,7 @@ enum SettingsIndex {
 
         // Notifications
         .init(.notificationsEnabled, .notifications, "Enable notifications",
-              "banner alert macos notify"),
+              "banner alert macos notify agent omp permission finished"),
         .init(.notifyOnBell, .notifications, "Notify on terminal bell",
               "bel alert sound claude code waiting"),
         .init(.notifyOnlyWhenUnfocused, .notifications, "Only when the tab isn't focused",

@@ -91,6 +91,11 @@ package struct AppSettings: Codable, Equatable {
     /// jump-to-prompt and relative-path links stop working.
     package var shellIntegrationEnabled: Bool = true
 
+    /// Extra environment for every new tab, whatever its profile. Set after
+    /// Kuddo's own variables, so one here replaces Kuddo's, and before the
+    /// profile's, which win over these.
+    package var environment: [String: String] = [:]
+
     /// Profile ⌘T opens. nil means the first profile on disk.
     package var defaultProfileId: String? = nil
 
@@ -101,7 +106,7 @@ package struct AppSettings: Codable, Equatable {
              confirmClearScreen,
              notificationsEnabled, notifyOnBell, notifyOnlyWhenUnfocused,
              scrollbackLines, keepScrollPosition, shellIntegrationEnabled,
-             defaultProfileId
+             environment, defaultProfileId
         /// Read-only key for migrating old settings; we never write it back.
         case thinStrokes
     }
@@ -125,6 +130,7 @@ package struct AppSettings: Codable, Equatable {
         try c.encode(scrollbackLines, forKey: .scrollbackLines)
         try c.encode(keepScrollPosition, forKey: .keepScrollPosition)
         try c.encode(shellIntegrationEnabled, forKey: .shellIntegrationEnabled)
+        try c.encode(environment, forKey: .environment)
         try c.encodeIfPresent(defaultProfileId, forKey: .defaultProfileId)
     }
 
@@ -176,6 +182,8 @@ package struct AppSettings: Codable, Equatable {
             try c.decodeIfPresent(Bool.self, forKey: .keepScrollPosition) ?? true
         self.shellIntegrationEnabled =
             try c.decodeIfPresent(Bool.self, forKey: .shellIntegrationEnabled) ?? true
+        self.environment =
+            try c.decodeIfPresent([String: String].self, forKey: .environment) ?? [:]
         self.defaultProfileId = try c.decodeIfPresent(String.self, forKey: .defaultProfileId)
     }
 }

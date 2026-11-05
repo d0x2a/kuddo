@@ -25,6 +25,8 @@ struct SettingsView: View {
 
     /// Set when something outside Settings — the ⌘K hub — asked for a control.
     @ObservedObject private var route = SettingsRoute.shared
+    /// Stops a pane adds as it goes, such as an environment editor's rows.
+    @ObservedObject private var dynamicStops = SettingsDynamicStops.shared
 
     private var results: [SettingsEntry] { SettingsIndex.search(query) }
 
@@ -42,16 +44,19 @@ struct SettingsView: View {
         .searchable(text: $query, placement: .sidebar, prompt: "Search settings")
         .onKeyPress(keys: [.tab]) { press in
             let delta = press.modifiers.contains(.shift) ? -1 : 1
-            let next = nextFocus(after: focus, in: stops, by: delta)
+            // Tab on an AppKit stop comes here too. Where it holds first
+            // responder, that's where focus is, whatever the focus state says.
+            let current = SettingsKeyViews.shared.focused ?? focus
+            let next = nextFocus(after: current, in: stops, by: delta)
             if keyboardActive {
-                focus = next
+                move(to: next)
             } else {
                 // First Tab: the controls only become focusable as a result of
                 // this same state change, so the assignment has to wait for the
                 // next pass — focus set on a view that isn't focusable yet is
                 // dropped.
                 keyboardActive = true
-                DispatchQueue.main.async { focus = next }
+                DispatchQueue.main.async { move(to: next) }
             }
             return .handled
         }
@@ -152,6 +157,18 @@ struct SettingsView: View {
         }
     }
 
+    /// Focuses a stop: through the focus state, or for an AppKit one by
+    /// making it first responder. Clearing the focus state first ends editing
+    /// in a field, then the view takes over on the next pass.
+    private func move(to field: SettingsField?) {
+        guard let field, let view = SettingsKeyViews.shared.view(for: field) else {
+            focus = field
+            return
+        }
+        focus = nil
+        DispatchQueue.main.async { _ = view.window?.makeFirstResponder(view) }
+    }
+
     private func applyPendingFocus() {
         guard let field = pendingFocus else { return }
         pendingFocus = nil
@@ -174,7 +191,7 @@ struct SettingsView: View {
         if category == .notifications, !store.settings.notificationsEnabled {
             fields = [.notificationsEnabled]
         }
-        return [.sidebar] + fields
+        return [.sidebar] + expandStops(fields, with: dynamicStops.expansions)
     }
 
     @ViewBuilder
@@ -182,6 +199,7 @@ struct SettingsView: View {
         switch category {
         case .appearance:    AppearancePane(focus: $focus)
         case .profiles:      ProfilesPane(focus: $focus)
+        case .environment:   EnvironmentPane(focus: $focus)
         case .triggers:      TriggersPane(focus: $focus)
         case .general:       GeneralPane(focus: $focus)
         case .notifications: NotificationsPane(focus: $focus)

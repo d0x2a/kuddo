@@ -13,6 +13,14 @@ enum SettingsField: Hashable {
     case profileList, profileAdd, profileRemove, profileMoveUp, profileMoveDown
     case profileName, profileCommand, profileDirectory, profileChooseDirectory
     case profileTheme, profileDefault, profileEnvAdd
+    // Environment
+    case tabEnvAdd
+    // An environment editor's own controls, in either pane: a saved
+    // variable's Edit and Remove, by name, and the one row open for editing.
+    // The rows come and go, so they aren't in `SettingsIndex`: the editor
+    // hangs them off its indexed control (`SettingsDynamicStops`).
+    case envEdit(String), envDelete(String)
+    case envName, envValue, envCancel, envSave
     // Triggers
     case triggerList, triggerAdd, triggerRemove, triggerMoveUp, triggerMoveDown
     case triggerEnabled, triggerName, triggerPattern, triggerSample
@@ -43,6 +51,57 @@ func nextFocus(after current: SettingsField?,
     let i = current.flatMap { stops.firstIndex(of: $0) } ?? 0
     let n = stops.count
     return stops[((i + delta) % n + n) % n]
+}
+
+/// `fields` with each one a pane has expanded replaced by its stops.
+func expandStops(_ fields: [SettingsField],
+                 with expansions: [SettingsField: [SettingsField]]) -> [SettingsField] {
+    fields.flatMap { expansions[$0] ?? [$0] }
+}
+
+/// Tab stops that come and go with what a pane shows — an environment
+/// editor's rows. `SettingsIndex` is static and can't list them, so the pane
+/// files them under one of its indexed controls, and `SettingsView` walks
+/// them in that control's place.
+///
+/// A shared object rather than a preference: a grouped Form hosts its rows
+/// in a table, and preferences set inside a row don't reliably reach a view
+/// above it. `owner` keeps an editor that is going away from clearing the
+/// stops of the one replacing it, whichever of the two SwiftUI runs first.
+@MainActor
+final class SettingsDynamicStops: ObservableObject {
+    static let shared = SettingsDynamicStops()
+    @Published private(set) var expansions: [SettingsField: [SettingsField]] = [:]
+    private var owners: [SettingsField: UUID] = [:]
+
+    func set(_ stops: [SettingsField], for anchor: SettingsField, owner: UUID) {
+        owners[anchor] = owner
+        if expansions[anchor] != stops { expansions[anchor] = stops }
+    }
+
+    func clear(_ anchor: SettingsField, owner: UUID) {
+        guard owners[anchor] == owner else { return }
+        owners[anchor] = nil
+        expansions[anchor] = nil
+    }
+}
+
+/// Edits in Settings that are open: begun, and neither saved nor cancelled.
+/// Esc cancels one rather than closing the window (`SettingsWindow`), so
+/// each comes with what cancelling it means.
+@MainActor
+enum SettingsEdits {
+    private static var cancels: [UUID: () -> Void] = [:]
+
+    static func begin(_ id: UUID, cancel: @escaping () -> Void) { cancels[id] = cancel }
+    static func end(_ id: UUID) { cancels[id] = nil }
+
+    /// Cancels whatever is open; false when nothing was.
+    static func cancelOpen() -> Bool {
+        let open = Array(cancels.values)
+        open.forEach { $0() }
+        return !open.isEmpty
+    }
 }
 
 /// Whether the pane's controls are part of the focus system at all.

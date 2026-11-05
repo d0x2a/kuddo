@@ -1200,6 +1200,26 @@ do {
           SettingsIndex.fields(in: .general).contains(.scrollbackLines))
     check("so is shell integration",
           SettingsIndex.fields(in: .general).contains(.shellIntegration))
+    let env = SettingsIndex.search("environment").map(\.field)
+    check("\"environment\" finds the variables for every tab and the profile's",
+          env.contains(.tabEnvAdd) && env.contains(.profileEnvAdd), "got \(env)")
+    check("the variables for every tab have their own pane",
+          SettingsIndex.fields(in: .environment) == [.tabEnvAdd]
+              && !SettingsIndex.fields(in: .general).contains(.tabEnvAdd))
+
+    // An environment editor's rows are Tab stops in its control's place.
+    let expanded = expandStops([.profileDefault, .profileEnvAdd],
+                               with: [.profileEnvAdd: [.envEdit("A"), .envDelete("A"),
+                                                       .envEdit("B"), .envDelete("B"),
+                                                       .profileEnvAdd]])
+    check("each variable's Edit and Remove are Tab stops, ahead of Add Variable",
+          expanded == [.profileDefault, .envEdit("A"), .envDelete("A"),
+                       .envEdit("B"), .envDelete("B"), .profileEnvAdd], "got \(expanded)")
+    check("Tab goes from a row's Edit to its Remove, then the next row",
+          nextFocus(after: .envEdit("A"), in: expanded, by: 1) == .envDelete("A")
+              && nextFocus(after: .envDelete("A"), in: expanded, by: 1) == .envEdit("B"))
+    check("a pane with nothing expanded keeps its stops",
+          expandStops([.warnOnClose], with: [:]) == [.warnOnClose])
 }
 
 section("coding-agent events")
@@ -1254,6 +1274,41 @@ do {
           AgentEvent(json: #"{"event":"tool_complete","tool_name":"bash"}"#)?.banner == nil)
     check("a body that isn't an event is ignored",
           AgentEvent(json: "not json") == nil && AgentEvent(json: #"{"v":1}"#) == nil)
+}
+
+section("environment for every tab")
+do {
+    let env = ["EDITOR": "vim", "PATH": "/bin"]
+    func adding(_ name: String, _ value: String) -> EnvEdit {
+        EnvEdit(original: nil, name: name, value: value)
+    }
+    check("a new variable saves into the rest",
+          adding(" TOKEN ", "a=b").applied(to: env) == ["EDITOR": "vim", "PATH": "/bin", "TOKEN": "a=b"]
+              && adding("TOKEN", "x").canSave(in: env))
+    check("a row just opened isn't an error, but can't be saved",
+          EnvEdit.new.problem(in: env) == nil && !EnvEdit.new.canSave(in: env))
+    check("a name can't hold '='", adding("A=B", "1").problem(in: env) != nil)
+    check("or a space", adding("MY VAR", "1").problem(in: env) != nil)
+    check("a value needs a name", adding("", "secret").problem(in: env) != nil)
+    check("a new variable can't take a name already set",
+          adding("PATH", "/x").problem(in: env) != nil)
+    var edit = EnvEdit.editing("EDITOR", in: env)
+    check("a variable opened unchanged has nothing to save",
+          edit.value == "vim" && edit.problem(in: env) == nil && !edit.canSave(in: env))
+    edit.value = "nvim"
+    check("changing its value saves just that",
+          edit.canSave(in: env) && edit.applied(to: env) == ["EDITOR": "nvim", "PATH": "/bin"])
+    edit.name = "VISUAL"
+    check("renaming it takes the old name out",
+          edit.applied(to: env) == ["VISUAL": "nvim", "PATH": "/bin"])
+    edit.name = "PATH"
+    check("but not onto another variable's name", !edit.canSave(in: env))
+    var settings = AppSettings()
+    settings.environment = ["EDITOR": "vim", "WARP_CLI_AGENT_PROTOCOL_VERSION": "0"]
+    let back = try! JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(settings))
+    check("the variables survive a save", back.environment == settings.environment)
+    let old = try! JSONDecoder().decode(AppSettings.self, from: Data(#"{"fontSize":13}"#.utf8))
+    check("a settings file from before has none", old.environment.isEmpty && old.fontSize == 13)
 }
 
 section("saved state")

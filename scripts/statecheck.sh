@@ -4,8 +4,9 @@
 # Compiles the real terminal sources directly rather than linking the app
 # target: none of this needs a window, a Metal device or a PTY. All of
 # KuddoCore goes in — it is AppKit-free and self-contained by construction, so
-# the list can't go stale the way a hand-kept one did — plus the settings index
-# from KuddoApp, which is pure data but belongs to the Settings window.
+# the list can't go stale the way a hand-kept one did — plus the settings index,
+# Tab-order helpers and environment-edit rules from KuddoApp, which belong to
+# the Settings window but need no window to check.
 # SwiftUI is linked because ProfileStore uses its MutableCollection.move.
 #
 # `-package-name` because the core marks its cross-target API `package`.
@@ -18,6 +19,7 @@ swiftc -package-name Kuddo -framework SwiftUI -o "$out" \
     scripts/statecheck/main.swift \
     $(find Sources/KuddoCore -name '*.swift' | sort) \
     Sources/KuddoApp/Settings/SettingsIndex.swift \
-    Sources/KuddoApp/Settings/SettingsKeyboard.swift
+    Sources/KuddoApp/Settings/SettingsKeyboard.swift \
+    Sources/KuddoApp/Settings/EnvEdit.swift
 
 exec "$out" "$@"
