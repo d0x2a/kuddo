@@ -1202,6 +1202,60 @@ do {
           SettingsIndex.fields(in: .general).contains(.shellIntegration))
 }
 
+section("coding-agent events")
+do {
+    // Bytes omp 18.11.0 wrote at startup with WARP_CLI_AGENT_PROTOCOL_VERSION=1,
+    // captured from a real run; only the paths are shortened.
+    let (s, feed) = buffer()
+    var posted: [(String, String)] = []
+    s.onNotify = { posted.append(($0, $1)) }
+    feed("\u{1B}]777;notify;warp://cli-agent;{\"event\":\"session_start\",\"v\":1,"
+         + "\"agent\":\"omp\",\"session_id\":\"01a1a703-ad20\",\"cwd\":\"/tmp/omp-run\","
+         + "\"project\":\"omp-run\",\"plugin_version\":\"18.11.0\"}\u{07}")
+    check("the event arrives as an OSC 777 titled warp://cli-agent",
+          posted.count == 1 && posted.first?.0 == AgentEvent.notificationTitle,
+          "got \(posted.map(\.0))")
+    let start = posted.first.flatMap { AgentEvent(json: $0.1) }
+    check("its body parses", start?.event == "session_start" && start?.agent == "omp")
+    check("and progress posts nothing", start != nil && start?.banner == nil)
+
+    // A ';' in the reply must stay in the body, not end it.
+    posted = []
+    feed("\u{1B}]777;notify;warp://cli-agent;{\"event\":\"stop\",\"agent\":\"omp\","
+         + "\"response\":\"Fixed it; the **test** in `Parser.swift`\\nnow passes.\"}\u{07}")
+    let stop = posted.first.flatMap { AgentEvent(json: $0.1) }?.banner
+    check("a finished reply is the body, on one line, without markdown marks",
+          stop?.subtitle == "omp finished"
+              && stop?.body == "Fixed it; the test in Parser.swift now passes.",
+          "got \(String(describing: stop))")
+
+    // omp's first 200 characters of a real reply, which ran into a table.
+    let tour = AgentEvent(json: #"{"event":"stop","agent":"omp","response":"Here's a tour of ~/labs — roughly 25 projects. Active ones first:\n\n## Currently active\n\n| Project | What it is |\n|---|---|\n| *"}"#)?.banner
+    check("a reply's headings and table rows stay out of the banner",
+          tour?.body == "Here's a tour of ~/labs — roughly 25 projects. Active ones first:",
+          "got \(String(describing: tour?.body))")
+    let listed = AgentEvent(json: #"{"event":"stop","agent":"omp","response":"Done:\n- fixed #12\n> quoted\n```swift\nlet x = 1"}"#)?.banner
+    check("list and quote marks come off, an issue number stays",
+          listed?.body == "Done: fixed #12 quoted let x = 1",
+          "got \(String(describing: listed?.body))")
+    let onlyTable = AgentEvent(json: #"{"event":"stop","agent":"omp","response":"| a | b |\n|---|---|"}"#)?.banner
+    check("a reply that is all table falls back", onlyTable?.body == "Your turn")
+
+    let ask = AgentEvent(json: #"{"event":"permission_request","agent":"omp","tool_name":"bash","summary":"omp wants to run bash"}"#)?.banner
+    check("a permission request names the tool, and the agent only once",
+          ask?.subtitle == "omp" && ask?.body == "Wants to run bash",
+          "got \(String(describing: ask))")
+    let question = AgentEvent(json: #"{"event":"question_asked","agent":"omp","summary":"Waiting for your answer"}"#)?.banner
+    check("a question posts the agent's summary", question?.body == "Waiting for your answer")
+    let failed = AgentEvent(json: #"{"event":"stop_failure","agent":"omp","response":"","error_type":"aborted"}"#)?.banner
+    check("an empty failure says what kind it was",
+          failed?.subtitle == "omp stopped" && failed?.body == "Aborted")
+    check("per-tool progress posts nothing",
+          AgentEvent(json: #"{"event":"tool_complete","tool_name":"bash"}"#)?.banner == nil)
+    check("a body that isn't an event is ignored",
+          AgentEvent(json: "not json") == nil && AgentEvent(json: #"{"v":1}"#) == nil)
+}
+
 section("saved state")
 do {
     let saved = SavedState(tabs: [SavedTab(cwd: "/tmp", profileId: "ABC"), SavedTab(cwd: nil)],

@@ -36,7 +36,9 @@ struct NotificationsPane: View {
                     })
             } footer: {
                 Text("Posts a macOS notification when a program rings the bell or "
-                     + "sends a notification escape — e.g. Claude Code waiting for your input.")
+                     + "sends a notification escape — e.g. Claude Code waiting for your input, "
+                     + "or a coding agent such as omp asking to run a tool or finishing a reply. "
+                     + "The banner is headed by the tab's name.")
             }
         }
         .formStyle(.grouped)

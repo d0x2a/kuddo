@@ -1623,8 +1623,16 @@ final class TerminalView: NSView, CALayerDelegate {
         }
         s?.onNotify = { [weak self] title, body in
             guard let self else { return }
-            let t = title.isEmpty ? nil : title
-            self.delegate?.terminalView(self, didRequestAttention: .notification(title: t, body: body))
+            let attention: TerminalAttention
+            if title == AgentEvent.notificationTitle {
+                // A coding agent's progress report. Most of them don't ask for
+                // anyone, and those neither post nor mark the tab.
+                guard let banner = AgentEvent(json: body)?.banner else { return }
+                attention = .notification(title: banner.subtitle, body: banner.body)
+            } else {
+                attention = .notification(title: title.isEmpty ? nil : title, body: body)
+            }
+            self.delegate?.terminalView(self, didRequestAttention: attention)
         }
         session = s
     }

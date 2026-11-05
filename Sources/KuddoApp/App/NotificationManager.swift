@@ -41,15 +41,18 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
             .requestAuthorization(options: [.alert, .sound]) { _, _ in }
     }
 
-    /// Posts a banner. `tabId` lets a click reselect the originating tab.
-    func post(title: String, body: String, tabId: UUID) {
+    /// Posts a banner. `tabId` lets a click reselect the originating tab, and
+    /// groups a tab's banners together in Notification Center.
+    func post(title: String, subtitle: String, body: String, tabId: UUID) {
         guard isAvailable else { return }
         requestAuthorizationIfNeeded()
 
         let content = UNMutableNotificationContent()
         content.title = title
+        content.subtitle = subtitle
         content.body = body
         content.sound = .default
+        content.threadIdentifier = tabId.uuidString
         content.userInfo = [Self.tabIdKey: tabId.uuidString]
 
         // nil trigger → deliver immediately. Fresh id each time so banners

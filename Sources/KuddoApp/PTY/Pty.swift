@@ -59,6 +59,13 @@ final class Pty {
             // Code and anything using the `supports-hyperlinks` package take
             // this instead, and without it print a link as "label (url)".
             "FORCE_HYPERLINK=1",
+            // Kuddo reads Warp's cli-agent events (`AgentEvent`). A coding
+            // agent that speaks the protocol — omp does — sends what it is
+            // waiting on (a permission, a question, a finished reply) when
+            // it sees this. Without it, omp finds Kuddo on no list of its
+            // own and rings the bell instead. The value is the protocol
+            // version Kuddo understands.
+            "WARP_CLI_AGENT_PROTOCOL_VERSION=1",
         ]
         if ProcessInfo.processInfo.environment["LANG"] == nil {
             env.append("LANG=en_US.UTF-8")

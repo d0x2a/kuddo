@@ -22,6 +22,12 @@ package final class Tab {
     /// Only the ⌘K hub reads it today — it is what puts the bell marker on a
     /// row — but it is the state the sidebar would need for the same badge.
     var wantsAttention: Bool = false
+    /// A bell's banner, held back briefly in case a notification escape that
+    /// says more comes with it (`MainWindowController.bellGrace`).
+    var pendingBell: DispatchWorkItem?
+    /// When this tab last posted a notification escape, so a bell rung just
+    /// after it doesn't post a second banner.
+    var lastNotificationAt: Date?
     /// Set when this tab shows a tmux window rather than a shell of its own.
     /// Closing it closes the tmux window; it is not restored across launches,
     /// because the tmux server may be gone and reattaching is the user's call.
@@ -54,5 +60,36 @@ package final class Tab {
         if cwd == "/" { return "/" }
         if cwd == NSHomeDirectory() { return "~" }
         return (cwd as NSString).lastPathComponent
+    }
+
+    /// The tab's name at the head of a notification banner. Coding agents put
+    /// a status mark ahead of their title, which tells nothing in a banner
+    /// that only appears once they have stopped, so it comes off the front:
+    ///
+    /// - Claude Code: "✳ name" while it waits, a spinner frame while it works.
+    /// - omp: "π > name" — its own mark, then ">" idle, "!" waiting on you,
+    ///   ":" or a spinner frame while working.
+    ///
+    /// A leading emoji stays: that is someone's choice of name.
+    var notificationName: String { Self.notificationName(of: displayTitle) }
+
+    static func notificationName(of title: String) -> String {
+        let s = Array(title.unicodeScalars)
+        let start: Int
+        if s.count > 4, s[0] == "π", s[1] == " ", s[3] == " ",
+           !s[2].properties.isAlphabetic, !s[2].properties.isWhitespace,
+           s[2].properties.numericType == nil {
+            start = 4
+        } else if s.count > 2, s[1] == " ",
+                  s[0].properties.generalCategory == .otherSymbol || s[0] == "·",
+                  !s[0].properties.isEmojiPresentation {
+            start = 2
+        } else {
+            return title
+        }
+        var rest = String.UnicodeScalarView()
+        rest.append(contentsOf: s[start...])
+        let name = String(rest).trimmingCharacters(in: .whitespaces)
+        return name.isEmpty ? title : name
     }
 }

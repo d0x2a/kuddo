@@ -5,7 +5,8 @@ import AppKit
 enum TerminalAttention {
     /// Terminal bell (BEL / `\a`).
     case bell
-    /// OSC 9 / OSC 777 desktop-notification escape. `title` is nil for OSC 9.
+    /// OSC 9 / OSC 777 desktop-notification escape. `title` is nil for OSC 9;
+    /// for a coding agent's event (`AgentEvent`) it names the agent.
     case notification(title: String?, body: String)
 }
 
@@ -481,6 +482,35 @@ final class MainWindowController: NSWindowController, NSWindowDelegate,
         // user who turned banners off still wants to find the tab that rang.
         if !isTabFrontmost(tab) { tab.wantsAttention = true }
 
+        // A program that sends a notification escape may ring the bell in the
+        // same breath — omp does both when it asks a question — and that would
+        // be two banners for one request, one of them saying nothing. So a
+        // bell waits a moment for an escape and yields to one, and a bell just
+        // after one is dropped. Waiting also folds a burst of bells into one.
+        switch attention {
+        case .bell:
+            if let last = tab.lastNotificationAt,
+               Date().timeIntervalSince(last) < Self.bellGrace { return }
+            guard tab.pendingBell == nil else { return }
+            let work = DispatchWorkItem { [weak self, weak tab] in
+                guard let self, let tab, self.tabs.contains(where: { $0 === tab }) else { return }
+                tab.pendingBell = nil
+                self.postBanner(.bell, for: tab)
+            }
+            tab.pendingBell = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.bellGrace, execute: work)
+        case .notification:
+            tab.pendingBell?.cancel()
+            tab.pendingBell = nil
+            tab.lastNotificationAt = Date()
+            postBanner(attention, for: tab)
+        }
+    }
+
+    /// How long a bell waits for a notification escape that says more.
+    private static let bellGrace: TimeInterval = 0.5
+
+    private func postBanner(_ attention: TerminalAttention, for tab: Tab) {
         let settings = ThemeStore.shared.settings
         guard settings.notificationsEnabled else { return }
 
@@ -492,19 +522,26 @@ final class MainWindowController: NSWindowController, NSWindowDelegate,
         // Don't interrupt the user with what they're already looking at.
         if settings.notifyOnlyWhenUnfocused && isTabFrontmost(tab) { return }
 
+        // The tab heads the banner: with two Claude Code sessions open, its
+        // name is what says which one is asking, and it is where a click goes.
+        // Under it, whoever is speaking — the program's own title, or its
+        // name — then what it said.
+        let title = tab.notificationName
         let process = tab.terminalView.foregroundProcess?.name
-        let title: String
+        var subtitle: String?
         let body: String
         switch attention {
         case .bell:
-            title = process ?? tab.displayTitle
-            body = "wants your attention"
+            subtitle = process
+            body = "Wants your attention"
         case .notification(let t, let b):
-            title = t ?? process ?? tab.displayTitle
+            subtitle = t ?? process
             body = b
         }
+        if subtitle == title { subtitle = nil }
 
-        NotificationManager.shared.post(title: title, body: body, tabId: tab.id)
+        NotificationManager.shared.post(title: title, subtitle: subtitle ?? "",
+                                        body: body, tabId: tab.id)
     }
 
     /// True when this tab is the one the user is actively looking at: app
