@@ -20,7 +20,7 @@ package enum TabPlacement: String, Codable, CaseIterable, Identifiable {
     case sidebar
     /// A strip under the title bar, one line a tab.
     case top
-    /// Nowhere: ⌘1–9, ⌃Tab and the ⌘K hub still switch tabs.
+    /// Nowhere: ⌘/ lists them, and ⌘1–9, ⌃Tab and the ⌘K hub still switch them.
     case hidden
 
     package var id: String { rawValue }

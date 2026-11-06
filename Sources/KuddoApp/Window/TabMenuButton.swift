@@ -1,9 +1,10 @@
 import AppKit
 
-/// The tabs button at the right of the title bar. A click opens a menu of the
-/// window's tabs, which is the way to them at a glance when they aren't on
-/// screen (`TabPlacement.hidden`). An orange dot on it says a tab wants you,
-/// the sidebar's waiting marker for a window that may not be showing one.
+/// The tabs button at the right of the title bar. A click, or ⌘/, opens a
+/// menu of the window's tabs, which is the way to them at a glance when
+/// they aren't on screen (`TabPlacement.hidden`). An orange dot on it says a
+/// tab wants you, the sidebar's waiting marker for a window that may not be
+/// showing one.
 final class TabMenuButton: NSView {
     /// Builds the menu at the moment of the click, so it lists the tabs as
     /// they are now.
@@ -67,15 +68,34 @@ final class TabMenuButton: NSView {
         }
     }
 
+    /// The menu while it's open. `popUp` doesn't return until the menu
+    /// closes, and a ⌘/ pressed meanwhile comes back in through
+    /// `toggleMenu`, which finds the menu here to close it.
+    private var openMenu: NSMenu?
+
+    /// ⌘/: the same menu a click opens, or shut if it's already open.
+    func toggleMenu() {
+        if openMenu != nil { closeMenu() } else { showMenu(nil) }
+    }
+
+    /// Shuts the menu if it's open. Main-menu shortcuts still fire while it
+    /// tracks, so ⌘2 can switch tabs under a menu that would then go on
+    /// showing the old tab ticked.
+    func closeMenu() {
+        openMenu?.cancelTracking()
+    }
+
     /// Under the button, its right edge on the button's: the button sits at
     /// the window's right edge, and a menu opening rightward from it would
     /// be pushed back by the screen edge anyway.
     @objc private func showMenu(_ sender: Any?) {
-        guard let menu = makeMenu?() else { return }
+        guard openMenu == nil, let menu = makeMenu?() else { return }
         let origin = NSPoint(x: bounds.maxX - menu.size.width,
                              y: isFlipped ? bounds.maxY + 2 : bounds.minY - 2)
+        openMenu = menu
         button.highlight(true)
         menu.popUp(positioning: nil, at: origin, in: self)
         button.highlight(false)
+        openMenu = nil
     }
 }

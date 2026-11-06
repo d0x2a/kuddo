@@ -264,6 +264,13 @@ package final class AppDelegate: NSObject, NSApplicationDelegate {
         activeController()?.selectPreviousTab()
     }
 
+    @objc func toggleTabList(_ sender: Any?) {
+        // Holding ⌘/ repeats the key equivalent, which would flick the menu
+        // shut and open again for as long as the keys stay down.
+        if NSApp.currentEvent?.isARepeat == true { return }
+        activeController()?.toggleTabList()
+    }
+
     @objc func selectTabByNumber(_ sender: Any?) {
         guard let item = sender as? NSMenuItem else { return }
         activeController()?.selectTabByNumber(item.tag)
@@ -280,6 +287,8 @@ package final class AppDelegate: NSObject, NSApplicationDelegate {
             return (controller?.tabCount ?? 0) > 0
         case #selector(selectNextTab(_:)), #selector(selectPreviousTab(_:)):
             return (controller?.tabCount ?? 0) > 1
+        case #selector(toggleTabList(_:)):
+            return (controller?.tabCount ?? 0) > 0
         case #selector(openNewTabWithProfile(_:)), #selector(toggleCommandPalette(_:)):
             return controller != nil
         case #selector(selectTabByNumber(_:)):

@@ -30,10 +30,18 @@ final class MainWindowController: NSWindowController, NSWindowDelegate,
     private let retainedWindow: NSWindow
 
     private(set) var tabs: [Tab] = [] {
-        didSet { TabDirectory.shared.setNeedsNotify() }
+        didSet {
+            TabDirectory.shared.setNeedsNotify()
+            if tabs.map(\.id) != oldValue.map(\.id) { tabMenuButton.closeMenu() }
+        }
     }
     private(set) var activeTabId: UUID? {
-        didSet { TabDirectory.shared.setNeedsNotify() }
+        didSet {
+            TabDirectory.shared.setNeedsNotify()
+            // The tabs menu lists what was true when it opened; a tab picked
+            // or closed by a shortcut while it's up would leave it wrong.
+            if activeTabId != oldValue { tabMenuButton.closeMenu() }
+        }
     }
 
     private let sidebar = SidebarView()
@@ -479,6 +487,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate,
             menu.addItem(item)
         }
         return menu
+    }
+
+    /// ⌘/: the title bar's tabs menu from the keyboard, or shut if it's open.
+    func toggleTabList() {
+        tabMenuButton.toggleMenu()
     }
 
     @objc private func selectTabFromMenu(_ item: NSMenuItem) {

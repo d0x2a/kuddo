@@ -174,6 +174,16 @@ enum MainMenu {
                                          keyEquivalent: "[")
         prevTab.keyEquivalentModifierMask = [.command, .shift]
 
+        // ⌘/ opens the title bar's tabs menu and closes it again: AppKit
+        // still matches this key equivalent while that menu is tracking, so
+        // the second press reaches `toggleTabList` and cancels it. A menu
+        // item rather than a keyCode monitor because AppKit relocalises a
+        // menu's key equivalent for layouts where "/" needs Shift.
+        let tabList = windowMenu.addItem(withTitle: "Show Tab List…",
+                                         action: #selector(AppDelegate.toggleTabList(_:)),
+                                         keyEquivalent: "/")
+        tabList.keyEquivalentModifierMask = [.command]
+
         // ⌘` / ⌘⇧` are wired in AppDelegate via an NSEvent local monitor
         // (see `installTabCycleShortcut`). They're not menu items because
         // (1) hidden NSMenuItems don't fire their key equivalents, and

@@ -49,7 +49,7 @@ struct AppearancePane: View {
                                   in: TabPlacement.allCases, by: direction)
                 }
                 if store.settings.tabPlacement == .hidden {
-                    Text("⌘1–9, ⌃Tab and the ⌘K hub still switch tabs.")
+                    Text("⌘/ lists the tabs, and ⌘1–9, ⌃Tab and the ⌘K hub still switch them.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

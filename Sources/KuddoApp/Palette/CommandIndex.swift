@@ -116,6 +116,9 @@ enum CommandIndex {
             // The hub's own chord. Nothing is gained by a row that reopens
             // the list you are already looking at.
             NSStringFromSelector(#selector(AppDelegate.toggleCommandPalette(_:))),
+            // ⌘/'s menu of tabs, for the same reason: the hub lists every
+            // tab already, so a row for it would trade one list for another.
+            NSStringFromSelector(#selector(AppDelegate.toggleTabList(_:))),
         ]
 
         func walk(_ menu: NSMenu) {

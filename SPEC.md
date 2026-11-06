@@ -69,7 +69,7 @@ Key boundaries:
 ## Window & Tab Model
 
 - **Tabs only. No splits.** One PTY per tab. For multi-pane workflows, use tmux/zellij.
-- **Sidebar tab list, not the system tab bar.** Tabs live in a left-hand sidebar (custom `SidebarView` inside an `NSSplitViewController`), not in macOS's `NSWindowTabbing`. Tab rows show the shell title over the foreground process and CWD. A setting moves the tabs to a strip along the top (`TabStripView`) or hides them, and a title bar button lists them in a menu either way; the system tab bar stays switched off (`allowsAutomaticWindowTabbing`). This trades the "merge windows / move tabs across windows" gestures for a denser, always-visible list that scales past ~10 tabs without overflow.
+- **Sidebar tab list, not the system tab bar.** Tabs live in a left-hand sidebar (custom `SidebarView` inside an `NSSplitViewController`), not in macOS's `NSWindowTabbing`. Tab rows show the shell title over the foreground process and CWD. A setting moves the tabs to a strip along the top (`TabStripView`) or hides them, and a title bar button lists them in a menu either way (⌘/ toggles it from the keyboard); the system tab bar stays switched off (`allowsAutomaticWindowTabbing`). This trades the "merge windows / move tabs across windows" gestures for a denser, always-visible list that scales past ~10 tabs without overflow.
 - New tabs always start in `$HOME`. (Older drafts of the spec called for inheriting the active tab's CWD, but in practice that surprised users more often than it helped — especially for GUI-launched sessions where the active tab's CWD might be deep inside a project tree.)
 - ⌘T / ⌘W / ⌘⇧[ / ⌘⇧] for tab navigation. ⌘1–⌘9 to jump to tab N.
 - **⌘K opens the hub** — one search field over every tab (in every window) and every menu action, ranked together. Tab rows carry the index, run state, title, working directory and foreground process, because three tabs called `Kuddo` is the normal case and the title alone never identifies one. Sections are ordered by their best-scoring member, so row 1 is always the best answer to ⏎. With an empty query it lists recent tabs with the previous one preselected, which makes ⌘K ⏎ a flip back. ⌘⌫ closes the highlighted tab without leaving the hub.
@@ -207,6 +207,7 @@ Sensible Mac defaults out of the box. All overridable.
 | Close tab | ⌘W |
 | Next/prev tab | ⌘⇧] / ⌘⇧[ (also ⌘` / ⌘⇧`) |
 | Jump to tab N | ⌘N (1–9) |
+| Show/hide tab list | ⌘/ |
 | Find in scrollback | ⌘F |
 | Find regex | ⌥⌘F |
 | Next/prev match | ⌘G / ⇧⌘G |
