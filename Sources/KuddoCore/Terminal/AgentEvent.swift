@@ -18,7 +18,8 @@ import Foundation
 /// Most events are progress, not a request: `session_start`,
 /// `prompt_submit`, `tool_complete` and `permission_replied` arrive on every
 /// turn, and posting them would be a banner per tool call. Only the four
-/// that leave the agent waiting on a person make a banner.
+/// that leave the agent waiting on a person make a banner, and a stop only
+/// from a session someone prompted, not a subagent's (`AgentSessions`).
 package struct AgentEvent: Equatable {
     /// The OSC 777 title that marks a body as one of these.
     package static let notificationTitle = "warp://cli-agent"
@@ -33,6 +34,10 @@ package struct AgentEvent: Equatable {
     /// the error. omp sends at most 200 characters of it.
     package var response: String?
     package var errorType: String?
+    /// Which of the agent's sessions this came from. omp's subagents report
+    /// through the same terminal as the session that started them, each
+    /// under its own id.
+    package var sessionId: String?
 
     /// nil for a body that isn't a JSON object with an `event`.
     package init?(json body: String) {
@@ -51,6 +56,7 @@ package struct AgentEvent: Equatable {
         self.summary = text("summary")
         self.response = text("response")
         self.errorType = text("error_type")
+        self.sessionId = object["session_id"] as? String
     }
 
     /// What the banner says under the tab's name: who, then what. nil for an
@@ -91,6 +97,9 @@ package struct AgentEvent: Equatable {
         return rest.prefix(1).uppercased() + rest.dropFirst()
     }
 
+    /// True for a report that a session finished its turn.
+    var isStop: Bool { event == "stop" || event == "stop_failure" }
+
     /// A banner line from markdown source. The prose stays and the structure
     /// goes: a heading only labels what follows it, and a table cut to fit a
     /// banner is a row of pipes ("| Project | What it is | |---|"), so both
@@ -118,5 +127,38 @@ package struct AgentEvent: Equatable {
         let limit = 300
         if text.count > limit { text = String(text.prefix(limit)) + "…" }
         return text
+    }
+}
+
+/// One tab's agent sessions, told apart by who started them.
+///
+/// omp runs its subagents in the process the tab is running, and each one
+/// opens a session of its own that reports through this terminal: a
+/// `session_start`, its tool calls, and a `stop` when it hands its result
+/// back. A task tool that fans out to five scouts finishes five times before
+/// the agent you asked has finished once, and every one of those is a banner
+/// saying "omp finished" over a result meant for the agent, not for you.
+///
+/// What sets the session you're talking to apart is that you talk to it:
+/// omp sends `prompt_submit` only for a message a person typed, never for the
+/// assignment a subagent starts with. So a stop counts only from a session
+/// that has had a prompt here. Questions and permission requests go through
+/// from any session, because whichever one sent them is waiting on you.
+package struct AgentSessions {
+    private var prompted: Set<String> = []
+
+    package init() {}
+
+    /// The banner for `event`, or nil when it shouldn't make one.
+    package mutating func banner(for event: AgentEvent) -> (subtitle: String?, body: String)? {
+        if event.event == "prompt_submit", let id = event.sessionId {
+            prompted.insert(id)
+        }
+        // An agent that doesn't say which session it is gets the benefit of
+        // the doubt: there is nothing to tell its sessions apart by.
+        if event.isStop, let id = event.sessionId, !prompted.contains(id) {
+            return nil
+        }
+        return event.banner
     }
 }

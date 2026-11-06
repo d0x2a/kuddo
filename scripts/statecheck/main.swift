@@ -1274,6 +1274,37 @@ do {
           AgentEvent(json: #"{"event":"tool_complete","tool_name":"bash"}"#)?.banner == nil)
     check("a body that isn't an event is ignored",
           AgentEvent(json: "not json") == nil && AgentEvent(json: #"{"v":1}"#) == nil)
+
+    // omp 18.16.0's task tool fanning out to five scouts, from a recording on
+    // 2026-11-05: every scout opens its own session in the same terminal and
+    // reports `stop` when it hands its result back. Only the session that
+    // was prompted is the agent finishing.
+    func event(_ name: String, _ session: String?, _ fields: [String: String] = [:]) -> AgentEvent {
+        var object = fields.merging(["event": name, "agent": "omp"]) { $1 }
+        object["session_id"] = session
+        let json = try! JSONSerialization.data(withJSONObject: object)
+        return AgentEvent(json: String(decoding: json, as: UTF8.self))!
+    }
+    var sessions = AgentSessions()
+    _ = sessions.banner(for: event("session_start", "main"))
+    _ = sessions.banner(for: event("prompt_submit", "main"))
+    _ = sessions.banner(for: event("session_start", "scout"))
+    check("a subagent handing back its result posts nothing",
+          sessions.banner(for: event("stop", "scout", ["response": "kickpi: status block"])) == nil)
+    check("nor does a subagent that failed",
+          sessions.banner(for: event("stop_failure", "scout", ["error_type": "error"])) == nil)
+    check("a subagent's question still posts: it waits on you",
+          sessions.banner(for: event("question_asked", "scout")) != nil)
+    check("the prompted session finishing posts",
+          sessions.banner(for: event("stop", "main", ["response": "All five done."]))?.body
+              == "All five done.")
+    _ = sessions.banner(for: event("session_start", "resumed"))
+    _ = sessions.banner(for: event("prompt_submit", "resumed"))
+    check("a session switched to and prompted posts too",
+          sessions.banner(for: event("stop", "resumed")) != nil)
+    var anonymous = AgentSessions()
+    check("an agent that names no session still posts its stop",
+          anonymous.banner(for: event("stop", nil)) != nil)
 }
 
 section("environment for every tab")

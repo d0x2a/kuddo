@@ -152,6 +152,9 @@ final class TerminalView: NSView, CALayerDelegate {
     private var lastTriggerGeneration = TriggerStore.shared.generation
     private var currentTriggerMatches: [TriggerMatch] = []
     private var commandHeld: Bool = false
+    /// Which of an agent's sessions in this tab you've prompted, so a
+    /// subagent finishing doesn't read as the agent finishing.
+    private var agentSessions = AgentSessions()
     private var pathExistsCache: [String: Bool] = [:]
     private var pathCacheStamp: CFTimeInterval = 0
     private static let pathCacheTTL: CFTimeInterval = 2.0
@@ -1682,8 +1685,10 @@ final class TerminalView: NSView, CALayerDelegate {
             let attention: TerminalAttention
             if title == AgentEvent.notificationTitle {
                 // A coding agent's progress report. Most of them don't ask for
-                // anyone, and those neither post nor mark the tab.
-                guard let banner = AgentEvent(json: body)?.banner else { return }
+                // anyone, and those neither post nor mark the tab; nor does a
+                // subagent handing its result back to the agent that ran it.
+                guard let event = AgentEvent(json: body),
+                      let banner = self.agentSessions.banner(for: event) else { return }
                 attention = .notification(title: banner.subtitle, body: banner.body)
             } else {
                 attention = .notification(title: title.isEmpty ? nil : title, body: body)
